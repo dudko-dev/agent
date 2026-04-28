@@ -53,23 +53,6 @@ jobs:
         with:
           node-version: '22'
 
-      # npm Trusted Publishing requires npm >= 11.5.1. Node 22 LTS still
-      # ships npm 10.x, on which the OIDC token exchange silently does not
-      # happen and `npm publish` falls back to unauthenticated PUT - the
-      # registry then returns 404 (it never says "401" on writes to avoid
-      # leaking package existence).
-      #
-      # We use corepack (shipped with Node 22) instead of `npm install -g
-      # npm@latest`, because the latter has been flaky on hosted runners:
-      # the bundled npm sometimes can't resolve transitive dependencies
-      # like `promise-retry` mid-upgrade. corepack swaps the shim cleanly.
-      - name: Use TP-capable npm via corepack
-        run: |
-          set -euo pipefail
-          corepack enable
-          corepack prepare npm@11.5.1 --activate
-          npm --version
-
       - name: Install dependencies
         run: npm ci
 
@@ -101,18 +84,27 @@ jobs:
       # `npm publish` runs `prepublishOnly` (typecheck && test && build), so
       # we don't pre-build here.
       #
+      # We publish via `npx -y npm@11.5.1` rather than the system npm:
+      # Trusted Publishing requires npm >= 11.5.1, and Node 22 LTS still
+      # bundles npm 10.x. corepack-based shims have proven flaky on hosted
+      # runners (the activate step doesn't always land first in PATH), so
+      # we pin npm explicitly for this single command.
+      #
       # Auth strategy:
       #   - Preferred: npm Trusted Publishing (OIDC). No secret needed; npm
       #     verifies this workflow + environment against the package's
-      #     Trusted Publisher config. REQUIRES that the package already
-      #     exists on npm (TP cannot be configured for a non-existent pkg).
+      #     Trusted Publisher config on npmjs.com.
       #   - Bootstrap / fallback: NPM_TOKEN repo secret. Used automatically
-      #     when present (NODE_AUTH_TOKEN is empty -> OIDC is attempted;
-      #     non-empty -> classic token wins). Use this for the very first
-      #     publish, then switch to TP and remove the secret.
+      #     when present (NODE_AUTH_TOKEN empty -> OIDC is attempted;
+      #     non-empty -> classic token wins). Set NPM_TOKEN as a Granular
+      #     Access Token if TP is not yet configured.
       - name: Publish to npm
         if: steps.check.outputs.publish == 'true'
-        run: npm publish --provenance
+        run: |
+          set -euo pipefail
+          echo "Publishing with:"
+          npx -y npm@11.5.1 --version
+          npx -y npm@11.5.1 publish --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
