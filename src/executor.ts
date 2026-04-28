@@ -37,11 +37,13 @@ const BLOCKER_SENTINEL = '[BLOCKER]'
 // drives runner.ts's decision to invoke the replanner. Language-agnostic by
 // construction - works regardless of which language the executor wrote in.
 export const splitBlockerSentinel = (raw: string): { summary: string; blocked: boolean } => {
-  const idx = raw.indexOf(BLOCKER_SENTINEL)
-  if (idx === -1) {
+  if (!raw.includes(BLOCKER_SENTINEL)) {
     return { summary: raw, blocked: false }
   }
-  const cleaned = (raw.slice(0, idx) + raw.slice(idx + BLOCKER_SENTINEL.length)).trim()
+  // Strip every occurrence: the executor occasionally emits the sentinel
+  // twice (e.g. once mid-narrative and once at the end as required) and
+  // leaving stray copies in the summary leaks into downstream prompts.
+  const cleaned = raw.split(BLOCKER_SENTINEL).join('').trim()
   return { summary: cleaned, blocked: true }
 }
 

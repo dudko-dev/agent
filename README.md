@@ -112,6 +112,9 @@ Caveats:
 - **Plan changes.** The saved `currentPlan` (post any revise) is what gets used on resume — the planner is not re-invoked.
 - **Caps inherit.** `iterations` and `revisions` carry over, so per-run caps still apply across the boundary.
 - **Terminal status.** Resuming a run with `status: 'complete'` throws — re-read the saved `text` directly instead.
+- **Event semantics.** On resume the runner re-emits a `plan.created` event so consumers attaching mid-resume see the canonical plan; consumers that store every event will observe `plan.created` twice for the same `runId`. `onRunStart` is **not** re-fired (the original run already emitted it) — code that counts run starts must use `runId` for de-duplication. `onStepComplete` only fires for steps the resumed run actually executes; pre-resume steps are already in the loaded `trace`.
+- **Inputs are locked to the snapshot.** Both `options.input` and `options.history` passed to `agent.run({ resumeFromRunId })` are **silently ignored** in favor of the values stored at the original run start. This keeps the resumed prompt deterministic against the saved trace; pass an empty input (`input: ''`) to make the override explicit.
+- **runId hygiene.** Persisted `runId`s end up in filesystem paths (`<sandboxRoot>/<runId>/`) and are validated against `^[a-zA-Z0-9_-]{1,128}$`. A persistence adapter that returns a snapshot whose `runId` differs from the requested one, or that contains path-unsafe characters, is rejected.
 
 ### OpenTelemetry
 
@@ -155,6 +158,7 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 | `toolSelectionStrategy` | `'all'` (default) gives the executor every tool each step; `'plan-narrowed'` exposes only `step.suggestedTools`. |
 | `outputSanitizer` | Optional `(toolName, output) => unknown` hook to redact tool results before they reach the LLM. |
 | `inputSanitizer` | Optional `(toolName, input) => unknown` hook to redact LLM-generated tool args before they hit the MCP server **and** before they appear in `step.tool-call` events. **Must be idempotent** — applied at both the event boundary and the dispatch boundary. |
+| `outputSanitizer` ordering | The sanitizer runs on the **raw MCP `result.content`** (image/audio base64 still inline), **before** the agent spills binary parts to the sandbox. This favors privacy: a sanitizer that drops a sensitive image keeps the bytes out of the disk entirely. If you want post-spill sanitization (e.g. redact a path), do it in your tool wrapper instead. |
 | `sandboxRoot` | Per-run sandbox subdirs are created at `<sandboxRoot>/<runId>/` for tools that spill binary content (images, audio, blob resources). Defaults to `<os.tmpdir()>/agent-sandbox`. |
 | `keepSandbox` | When `true`, the per-run directory is not removed after the run completes. Default `false`. |
 | `systemPrompt` | Appended to the planner, executor, replanner, and synthesizer system prompts so the same domain context (persona, language, tone) reaches every stage. |

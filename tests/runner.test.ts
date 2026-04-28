@@ -67,7 +67,7 @@ const ctxWith = (config: IAgentConfig): IAgentInternalContext => ({
 })
 
 const sampleSnapshot = (overrides: Partial<IRunSnapshot> = {}): IRunSnapshot => ({
-  runId: 'r-original',
+  runId: 'r1',
   startedAt: 1_000,
   status: 'executing',
   input: 'do thing',
@@ -123,12 +123,35 @@ test('resolveResume rejects a complete snapshot (cannot resume from terminal)', 
 
 test('resolveResume rejects a snapshot with no plan', async () => {
   const persistence: IPersistence = {
-    loadRun: () => sampleSnapshot({ status: 'planning', plan: undefined }),
+    loadRun: () => sampleSnapshot({ plan: undefined }),
   }
   await assert.rejects(
     () =>
       resolveResume(ctxWith(baseConfig({ persistence })), { input: 'x', resumeFromRunId: 'r1' }),
     /no saved plan/,
+  )
+})
+
+test('resolveResume rejects a malformed resumeFromRunId (path-traversal guard)', async () => {
+  const persistence: IPersistence = { loadRun: () => sampleSnapshot() }
+  await assert.rejects(
+    () =>
+      resolveResume(ctxWith(baseConfig({ persistence })), {
+        input: 'x',
+        resumeFromRunId: '../../etc/passwd',
+      }),
+    /Unsafe runId/,
+  )
+})
+
+test('resolveResume rejects when persistence returns a runId mismatch', async () => {
+  const persistence: IPersistence = {
+    loadRun: () => sampleSnapshot({ runId: 'someone-elses-id' }),
+  }
+  await assert.rejects(
+    () =>
+      resolveResume(ctxWith(baseConfig({ persistence })), { input: 'x', resumeFromRunId: 'r1' }),
+    /refusing to resume on mismatch/,
   )
 })
 
@@ -142,9 +165,9 @@ test('resolveResume returns the snapshot for a resumable status (failed)', async
   const persistence: IPersistence = { loadRun: () => snapshot }
   const r = await resolveResume(ctxWith(baseConfig({ persistence })), {
     input: 'x',
-    resumeFromRunId: 'r-original',
+    resumeFromRunId: 'r1',
   })
-  assert.equal(r?.runId, 'r-original')
+  assert.equal(r?.runId, 'r1')
   assert.equal(r?.iterations, 2)
   assert.equal(r?.stepIndex, 1)
 })
@@ -159,8 +182,8 @@ test('resolveResume awaits a Promise returned by loadRun', async () => {
   }
   const r = await resolveResume(ctxWith(baseConfig({ persistence })), {
     input: 'x',
-    resumeFromRunId: 'r-original',
+    resumeFromRunId: 'r1',
   })
-  assert.equal(r?.runId, 'r-original')
+  assert.equal(r?.runId, 'r1')
   assert.equal(r?.status, 'cancelled')
 })

@@ -1,5 +1,8 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import {
+  getDefaultEnvironment,
+  StdioClientTransport,
+} from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
@@ -10,6 +13,7 @@ import path from 'node:path'
 import { URL } from 'node:url'
 import packageJson from '../package.json' with { type: 'json' }
 import { getCurrentRunSandbox } from './context.ts'
+import { ATTR, withSpan } from './tracing.ts'
 import type { IMcpServerConfig } from './types.ts'
 
 const isStdioConfig = (
@@ -96,57 +100,70 @@ export const connectMcpServers = async (
       tools[prefixed] = dynamicTool({
         description,
         inputSchema: jsonSchema(t.inputSchema as Parameters<typeof jsonSchema>[0]),
-        execute: async (args, opts) => {
-          let toSend: Record<string, unknown> = (args ?? {}) as Record<string, unknown>
-          if (inputSanitizer) {
-            try {
-              const sanitized = await inputSanitizer(prefixed, toSend)
-              // The sanitizer can return any shape; coerce non-objects to a
-              // wrapper so the MCP "arguments" field stays a JSON object.
-              toSend =
-                sanitized && typeof sanitized === 'object' && !Array.isArray(sanitized)
-                  ? (sanitized as Record<string, unknown>)
-                  : { value: sanitized }
-            } catch (err) {
-              log(
-                'warn',
-                `[mcp] ${prefixed}: inputSanitizer threw - ${(err as Error).message}; input replaced with placeholder`,
-              )
-              toSend = { _redacted: 'inputSanitizer failed' }
-            }
-          }
-          const result = await client.callTool(
-            {
-              name: t.name,
-              arguments: toSend,
+        execute: async (args, opts) =>
+          withSpan(
+            'agent.tool_call',
+            { [ATTR.TOOL_NAME]: prefixed },
+            async (span): Promise<unknown> => {
+              let toSend: Record<string, unknown> = (args ?? {}) as Record<string, unknown>
+              if (inputSanitizer) {
+                try {
+                  const sanitized = await inputSanitizer(prefixed, toSend)
+                  // The sanitizer can return any shape; coerce non-objects to a
+                  // wrapper so the MCP "arguments" field stays a JSON object.
+                  toSend =
+                    sanitized && typeof sanitized === 'object' && !Array.isArray(sanitized)
+                      ? (sanitized as Record<string, unknown>)
+                      : { value: sanitized }
+                } catch (err) {
+                  log(
+                    'warn',
+                    `[mcp] ${prefixed}: inputSanitizer threw - ${(err as Error).message}; input replaced with placeholder`,
+                  )
+                  toSend = { _redacted: 'inputSanitizer failed' }
+                }
+              }
+              let result
+              try {
+                result = await client.callTool(
+                  { name: t.name, arguments: toSend },
+                  undefined,
+                  opts?.abortSignal ? { signal: opts.abortSignal } : undefined,
+                )
+              } catch (err) {
+                span.setAttribute(ATTR.TOOL_OK, false)
+                throw err
+              }
+              // outputSanitizer runs BEFORE flattenContent so the user can
+              // redact the raw MCP content (including image/audio base64 data
+              // that would otherwise be spilled to disk before sanitisation).
+              // Caller wanting post-spill redaction can sanitise the file path
+              // they receive in the model-facing output - this order favors
+              // privacy by default.
+              let raw: unknown = result.content
+              if (outputSanitizer) {
+                try {
+                  raw = await outputSanitizer(prefixed, raw)
+                } catch (err) {
+                  log(
+                    'warn',
+                    `[mcp] ${prefixed}: outputSanitizer threw - ${(err as Error).message}; output replaced with placeholder`,
+                  )
+                  span.setAttribute(ATTR.TOOL_OK, false)
+                  return '[output redacted: sanitizer failed]'
+                }
+              }
+              const flat = await flattenContent(raw, {
+                toolName: prefixed,
+                // Resolved per-call so concurrent runs spill into their own
+                // per-runId subdirs. undefined when called outside of a run
+                // (defensive; in practice every tool call sits inside runAgentLoop).
+                sandboxDir: getCurrentRunSandbox(),
+              })
+              span.setAttribute(ATTR.TOOL_OK, true)
+              return flat
             },
-            undefined,
-            opts?.abortSignal ? { signal: opts.abortSignal } : undefined,
-          )
-          const flat = await flattenContent(result.content, {
-            toolName: prefixed,
-            // Resolved per-call so concurrent runs spill into their own
-            // per-runId subdirs. undefined when called outside of a run
-            // (defensive; in practice every tool call sits inside runAgentLoop).
-            sandboxDir: getCurrentRunSandbox(),
-          })
-          if (!outputSanitizer) {
-            return flat
-          }
-          try {
-            return await outputSanitizer(prefixed, flat)
-          } catch (err) {
-            // Sanitizer failures must not leak details into the LLM tool
-            // output: a buggy sanitizer could otherwise expose internal
-            // logic or PII while attempting to scrub it. Log and return a
-            // safe placeholder; the run continues with degraded data.
-            log(
-              'warn',
-              `[mcp] ${prefixed}: outputSanitizer threw - ${(err as Error).message}; output replaced with placeholder`,
-            )
-            return '[output redacted: sanitizer failed]'
-          }
-        },
+          ),
       })
       catalog.push({ name: prefixed, description, server: name })
       mounted++
@@ -163,13 +180,18 @@ export const connectMcpServers = async (
       let transport: Transport
       if (isStdioConfig(cfg)) {
         // stdio: spawn the configured executable; the SDK pipes JSON-RPC
-        // over the child's stdin/stdout. We do NOT pass a default env here -
-        // when env is omitted the SDK calls getDefaultEnvironment() which
-        // already filters to a safe inheritance subset (PATH, HOME, etc.).
+        // over the child's stdin/stdout.
+        //
+        // Env merge: the SDK replaces (does NOT merge) when `env` is given,
+        // which means a user passing { DEBUG: '1' } loses PATH, HOME, etc.
+        // and the child can't find binaries on PATH. We merge here on top
+        // of getDefaultEnvironment() (the safe inheritance subset) so user
+        // additions are additive, not replacing.
+        const mergedEnv = cfg.env ? { ...getDefaultEnvironment(), ...cfg.env } : undefined
         transport = new StdioClientTransport({
           command: cfg.command,
           args: cfg.args,
-          env: cfg.env,
+          env: mergedEnv,
           cwd: cfg.cwd,
         })
       } else if (isHttpConfig(cfg)) {
@@ -292,8 +314,9 @@ const spillBase64 = async (
   kind: ISpilledRef['kind'],
   toolName: string,
   sandboxDir: string,
+  ensureDir: () => Promise<void>,
 ): Promise<ISpilledRef> => {
-  await mkdir(sandboxDir, { recursive: true })
+  await ensureDir()
   const ext = extFromMime(mimeType, kind)
   const safe = toolName.replace(SAFE_NAME, '_').slice(0, 32) || 'tool'
   const id = randomUUID().slice(0, 8)
@@ -325,6 +348,19 @@ export const flattenContent = async (
   }
   const sandboxDir = context?.sandboxDir
   const toolName = context?.toolName ?? 'tool'
+  // mkdir-once: when a tool result has many binary parts, spillBase64 used
+  // to mkdir() per part. Cache a single mkdir promise per flattenContent
+  // call so we make at most one syscall regardless of part count.
+  let mkdirOnce: Promise<void> | undefined
+  const ensureDir = (): Promise<void> => {
+    if (!sandboxDir) {
+      return Promise.resolve()
+    }
+    if (!mkdirOnce) {
+      mkdirOnce = mkdir(sandboxDir, { recursive: true }).then(() => undefined)
+    }
+    return mkdirOnce
+  }
   const out: unknown[] = []
   for (const p of parts) {
     if (p?.type === 'text' && typeof p.text === 'string') {
@@ -338,6 +374,7 @@ export const flattenContent = async (
         p.type as 'image' | 'audio',
         toolName,
         sandboxDir,
+        ensureDir,
       )
       out.push(ref)
       continue
@@ -351,6 +388,7 @@ export const flattenContent = async (
           'resource',
           toolName,
           sandboxDir,
+          ensureDir,
         )
         if (typeof r.uri === 'string') {
           ref.uri = r.uri

@@ -97,13 +97,3 @@ export const buildModelFromStage = (clientName: string, stage: IResolvedStage): 
     }
   }
 }
-
-// Backward-compat shim. Kept for tests that drove buildModel directly with a
-// model id. New code goes through resolveStage + buildModelFromStage.
-export const buildModel = (config: IAgentConfig, modelId: string): LanguageModel =>
-  buildModelFromStage(config.clientName, {
-    providerType: config.providerType,
-    baseURL: config.baseURL,
-    apiKey: config.apiKey,
-    model: modelId,
-  })

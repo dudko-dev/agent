@@ -261,7 +261,11 @@ export interface IAgentRunResult {
 export interface IRunSnapshot {
   runId: string
   startedAt: number
-  status: 'planning' | 'executing' | 'complete' | 'failed' | 'cancelled'
+  // 'executing' is the only non-terminal status the runtime writes; the
+  // others are written exactly once when the run resolves. ('planning' is
+  // intentionally omitted - we never persist before the plan is in hand,
+  // so there's no row in that state to query for.)
+  status: 'executing' | 'complete' | 'failed' | 'cancelled'
   input: string
   history?: IConversationTurn[]
   plan?: IPlan

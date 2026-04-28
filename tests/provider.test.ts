@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildModel, resolveStage } from '../src/provider.ts'
+import { buildModelFromStage, resolveStage } from '../src/provider.ts'
 import type { IAgentConfig, ProviderType } from '../src/types.ts'
 
 const baseConfig = (overrides: Partial<IAgentConfig> = {}): IAgentConfig => ({
@@ -18,24 +18,31 @@ const baseConfig = (overrides: Partial<IAgentConfig> = {}): IAgentConfig => ({
 const PROVIDERS: ProviderType[] = ['openai', 'anthropic', 'google']
 
 for (const providerType of PROVIDERS) {
-  test(`buildModel returns a model object for provider=${providerType}`, () => {
-    const model = buildModel(baseConfig({ providerType }), 'some-model')
+  test(`buildModelFromStage returns a model object for provider=${providerType}`, () => {
+    const model = buildModelFromStage('test', {
+      providerType,
+      apiKey: 'k',
+      model: 'some-model',
+    })
     assert.ok(model, 'expected a non-null model')
   })
 }
 
-test('buildModel for openai-compatible requires baseURL', () => {
+test('buildModelFromStage for openai-compatible requires baseURL', () => {
   assert.throws(
-    () => buildModel(baseConfig({ providerType: 'openai-compatible' }), 'm'),
+    () =>
+      buildModelFromStage('test', { providerType: 'openai-compatible', apiKey: 'k', model: 'm' }),
     /openai-compatible.*baseURL/,
   )
 })
 
-test('buildModel for openai-compatible accepts a baseURL', () => {
-  const model = buildModel(
-    baseConfig({ providerType: 'openai-compatible', baseURL: 'https://x.example/v1' }),
-    'm',
-  )
+test('buildModelFromStage for openai-compatible accepts a baseURL', () => {
+  const model = buildModelFromStage('test', {
+    providerType: 'openai-compatible',
+    apiKey: 'k',
+    baseURL: 'https://x.example/v1',
+    model: 'm',
+  })
   assert.ok(model)
 })
 

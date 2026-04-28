@@ -23,8 +23,12 @@ export const runRepl = async (): Promise<void> => {
   const config = loadConfig()
   const mcpNames = Object.keys(config.mcpServers)
 
+  // Resolve effective per-stage models: the override block wins over the
+  // legacy single-string shortcut, which in turn wins over the top-level model.
+  const plannerModelEff = config.planner?.model ?? config.plannerModel ?? config.model
+  const synthModelEff = config.synthesizer?.model ?? config.synthesizerModel ?? config.model
   console.log(
-    `[session] model=${config.model} planner=${config.plannerModel ?? config.model} synth=${config.synthesizerModel ?? config.model} provider=${config.providerType}`,
+    `[session] model=${config.model} planner=${plannerModelEff} synth=${synthModelEff} provider=${config.providerType}`,
   )
   console.log(
     `[session] maxIterations=${config.maxIterations} maxStepsPerTask=${config.maxStepsPerTask} timeoutMs=${config.llmTimeoutMs ?? 'none'} retries=${config.llmMaxRetries ?? 2}`,
@@ -46,6 +50,17 @@ export const runRepl = async (): Promise<void> => {
           streamingThought = true
         }
         process.stdout.write(event.delta)
+        break
+      case 'plan.step-added':
+        // Show the partial step as soon as the planner has streamed enough
+        // to display. The same step may be revised before plan.created lands;
+        // we re-render from plan.created when it arrives (cleaner than tracking
+        // partial->final diffs in the REPL).
+        if (streamingThought) {
+          process.stdout.write('\n')
+          streamingThought = false
+        }
+        console.log(`          ${event.index + 1}. ${event.step.description}`)
         break
       case 'plan.created':
         if (streamingThought) {
@@ -184,7 +199,9 @@ export const runRepl = async (): Promise<void> => {
         continue
       }
       if (prompt === '/status') {
-        console.log(`[status] model=${config.model} planner=${config.plannerModel ?? config.model}`)
+        console.log(
+          `[status] model=${config.model} planner=${plannerModelEff} synth=${synthModelEff}`,
+        )
         console.log(
           `[status] tools=${tools.length} mcp=${mcpNames.join(', ') || '(none)'} historyTurns=${history.length}`,
         )

@@ -6,10 +6,29 @@
 // finalized on completion. Schema is created lazily on first use.
 
 import { DatabaseSync } from 'node:sqlite'
-import type { IConversationTurn, IPersistence, IPlan, IRunSnapshot, IStepResult, IUsage } from '../src/index.ts'
+import type {
+  IConversationTurn,
+  IPersistence,
+  IPlan,
+  IRunSnapshot,
+  IStepResult,
+  IUsage,
+} from '../src/index.ts'
 
-export const makeSqlitePersistence = (filePath: string): IPersistence => {
+// Returned alongside the IPersistence facade so the caller can release the
+// DB handle on shutdown - a long-lived agent process inherits the handle and
+// node:sqlite will release it on exit, but tests / scripts should close
+// explicitly to avoid lingering file locks.
+export interface ISqlitePersistence extends IPersistence {
+  close: () => void
+}
+
+export const makeSqlitePersistence = (filePath: string): ISqlitePersistence => {
   const db = new DatabaseSync(filePath)
+  // WAL gives us concurrent readers + a single writer with sane crash-safety.
+  // For a single-process agent this is mostly a perf win; for multiple
+  // processes sharing one DB it's the correct journaling mode.
+  db.exec('PRAGMA journal_mode = WAL;')
   db.exec(`
     CREATE TABLE IF NOT EXISTS agent_runs (
       run_id TEXT PRIMARY KEY,
@@ -120,5 +139,6 @@ export const makeSqlitePersistence = (filePath: string): IPersistence => {
     onStepComplete: (snapshot) => write(snapshot),
     onRunComplete: (snapshot) => write(snapshot),
     loadRun: (runId) => read(runId),
+    close: () => db.close(),
   }
 }

@@ -16,17 +16,17 @@ const tracer = (): Tracer => {
 }
 
 // Common span attribute keys we set across the agent. Defined as constants
-// so consumers can build dashboards/queries against stable names.
+// so consumers can build dashboards/queries against stable names. Only keys
+// that are actually written somewhere in src/ are listed here - dead keys
+// give a false impression that a dashboard built on them would receive data.
 export const ATTR = {
   RUN_ID: 'agent.run_id',
   PHASE: 'agent.phase',
   PROVIDER: 'agent.provider',
   MODEL: 'agent.model',
   STEP_ID: 'agent.step.id',
-  STEP_INDEX: 'agent.step.index',
   STEP_BLOCKED: 'agent.step.blocked',
   REPLAN_MODE: 'agent.replan.mode',
-  REPLAN_CAUSE: 'agent.replan.cause',
   TOOL_NAME: 'agent.tool.name',
   TOOL_OK: 'agent.tool.ok',
   USAGE_INPUT_TOKENS: 'agent.usage.input_tokens',
@@ -56,33 +56,6 @@ export const withSpan = async <T>(
     }
     try {
       const result = await fn(span)
-      span.end()
-      return result
-    } catch (err) {
-      const e = err instanceof Error ? err : new Error(String(err))
-      span.recordException(e)
-      span.setStatus({ code: SpanStatusCode.ERROR, message: e.message })
-      span.end()
-      throw err
-    }
-  })
-}
-
-// Synchronous variant for tight code paths (e.g. emitting a span around a
-// pure helper). Same error/end semantics as withSpan.
-export const withSyncSpan = <T>(
-  name: string,
-  attrs: Record<string, string | number | boolean | undefined>,
-  fn: (span: Span) => T,
-): T => {
-  return tracer().startActiveSpan(name, (span) => {
-    for (const [k, v] of Object.entries(attrs)) {
-      if (v !== undefined) {
-        span.setAttribute(k, v)
-      }
-    }
-    try {
-      const result = fn(span)
       span.end()
       return result
     } catch (err) {
