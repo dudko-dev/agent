@@ -47,13 +47,47 @@ const resolveSandboxDir = (ctx: IAgentInternalContext, runId: string): string =>
   return path.join(root, runId)
 }
 
+// Resolve the resume snapshot up-front (outside the runContext) so the runId
+// reflects the original run rather than a freshly minted one. Throws on
+// errors the caller should fix (no persistence, no loadRun, missing run,
+// terminal status) - these are not transient, retrying won't help.
+//
+// Exported for direct unit testing - the validation matrix matters and
+// driving it through createAgent / agent.run() is overkill.
+export const resolveResume = async (
+  ctx: IAgentInternalContext,
+  options: IAgentRunOptions,
+): Promise<IRunSnapshot | undefined> => {
+  if (!options.resumeFromRunId) {
+    return undefined
+  }
+  if (!ctx.config.persistence?.loadRun) {
+    throw new Error('resumeFromRunId requires config.persistence.loadRun to be implemented')
+  }
+  const snapshot = await ctx.config.persistence.loadRun(options.resumeFromRunId)
+  if (!snapshot) {
+    throw new Error(`No persisted run found for runId "${options.resumeFromRunId}"`)
+  }
+  if (snapshot.status === 'complete') {
+    throw new Error(`Run "${options.resumeFromRunId}" is already complete; nothing to resume`)
+  }
+  if (!snapshot.plan) {
+    throw new Error(
+      `Run "${options.resumeFromRunId}" has no saved plan (status="${snapshot.status}"); cannot resume`,
+    )
+  }
+  return snapshot
+}
+
 export const runAgentLoop = async (
   ctx: IAgentInternalContext,
   options: IAgentRunOptions,
 ): Promise<IAgentRunResult> => {
-  const runId = randomUUID()
+  const resumed = await resolveResume(ctx, options)
+  const runId = resumed?.runId ?? randomUUID()
+  const startedAt = resumed?.startedAt ?? Date.now()
   const sandboxDir = resolveSandboxDir(ctx, runId)
-  return runContext.run({ runId, startedAt: Date.now(), sandboxDir }, async () => {
+  return runContext.run({ runId, startedAt, sandboxDir }, async () => {
     return withSpan(
       'agent.run',
       {
@@ -63,7 +97,7 @@ export const runAgentLoop = async (
       },
       async (span) => {
         try {
-          const result = await runAgentLoopInner(ctx, options)
+          const result = await runAgentLoopInner(ctx, options, resumed)
           span.setAttribute(ATTR.ITERATIONS, result.iterations)
           span.setAttribute(ATTR.USAGE_TOTAL_TOKENS, result.usage.totalTokens)
           span.setAttribute(ATTR.USAGE_INPUT_TOKENS, result.usage.inputTokens)
@@ -86,15 +120,26 @@ export const runAgentLoop = async (
 const runAgentLoopInner = async (
   ctx: IAgentInternalContext,
   options: IAgentRunOptions,
+  resumed: IRunSnapshot | undefined,
 ): Promise<IAgentRunResult> => {
-  const { input, signal } = options
+  const { signal } = options
+  // On resume the saved input wins so the resumed run prompts the planner /
+  // executor with the same context the original run had. Otherwise we'd
+  // be silently mixing two different requests in the same trace.
+  const input = resumed?.input ?? options.input
   // Snapshot history at run start: caller may keep mutating their array
   // (REPL pushes new turns after each run) but the in-flight run must see a
   // stable list. Cheap shallow copy; turns are themselves opaque to the agent.
-  const history = options.history ? [...options.history] : undefined
+  const history = resumed?.history
+    ? [...resumed.history]
+    : options.history
+      ? [...options.history]
+      : undefined
   const onEvent = options.onEvent ?? (() => {})
 
-  const totalUsage: IUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+  const totalUsage: IUsage = resumed
+    ? { ...resumed.usage }
+    : { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
   const startedAt = runContext.getStore()?.startedAt ?? Date.now()
   const runId = runContext.getStore()?.runId ?? '<unknown>'
 
@@ -142,58 +187,104 @@ const runAgentLoopInner = async (
   }
 
   let plan: IPlan
-  try {
-    plan = await createInitialPlan(input, history, proxiedCtx, signal)
-  } catch (err) {
-    proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'plan' })
-    if (isAbortError(err) || signal?.aborted) {
-      await callPersistence('onRunComplete', {
-        runId,
-        startedAt,
-        status: 'cancelled',
-        input,
-        history,
-        trace: [],
-        usage: totalUsage,
-        error: (err as Error).message,
-        completedAt: Date.now(),
-      })
-      throw err
+  if (resumed) {
+    // Resume path: planner already ran, plan + trace are durable. We emit a
+    // synthetic plan.created so consumers attaching mid-resume see the same
+    // event sequence they'd see on a fresh run.
+    plan = resumed.plan as IPlan
+    proxiedCtx.emit({
+      type: 'log',
+      level: 'info',
+      message: `[resume] continuing run ${runId} from step ${resumed.trace.length}/${plan.steps.length} (iterations=${resumed.iterations}, revisions=${resumed.revisions})`,
+    })
+    proxiedCtx.emit({ type: 'plan.created', plan })
+  } else {
+    try {
+      plan = await createInitialPlan(input, history, proxiedCtx, signal)
+    } catch (err) {
+      proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'plan' })
+      if (isAbortError(err) || signal?.aborted) {
+        await callPersistence('onRunComplete', {
+          runId,
+          startedAt,
+          status: 'cancelled',
+          input,
+          history,
+          trace: [],
+          usage: totalUsage,
+          stepIndex: 0,
+          iterations: 0,
+          revisions: 0,
+          error: (err as Error).message,
+          completedAt: Date.now(),
+        })
+        throw err
+      }
+      // Graceful degradation only for non-abort failures (e.g. schema validation
+      // on a small model). Falls back to a single-step "answer directly" plan
+      // rather than dropping the user's request.
+      plan = {
+        thought: 'Planner failed; answering directly without tool use.',
+        steps: [
+          {
+            id: 'fallback',
+            description: 'Answer the user directly using prior conversation and general knowledge.',
+            expectedOutcome: 'A direct answer to the user request.',
+          },
+        ],
+      }
     }
-    // Graceful degradation only for non-abort failures (e.g. schema validation
-    // on a small model). Falls back to a single-step "answer directly" plan
-    // rather than dropping the user's request.
-    plan = {
-      thought: 'Planner failed; answering directly without tool use.',
-      steps: [
-        {
-          id: 'fallback',
-          description: 'Answer the user directly using prior conversation and general knowledge.',
-          expectedOutcome: 'A direct answer to the user request.',
-        },
-      ],
-    }
+    proxiedCtx.emit({ type: 'plan.created', plan })
   }
-  proxiedCtx.emit({ type: 'plan.created', plan })
 
-  const trace: IStepResult[] = []
+  const trace: IStepResult[] = resumed ? [...resumed.trace] : []
   let currentPlan = plan
-  let stepIndex = 0
-  let iterations = 0
-  let revisions = 0
+  // On resume stepIndex must equal trace.length so we don't re-run a step
+  // whose result is already in the persisted trace. iterations / revisions
+  // carry over so per-run caps survive across crashes.
+  let stepIndex = resumed ? resumed.trace.length : 0
+  let iterations = resumed?.iterations ?? 0
+  let revisions = resumed?.revisions ?? 0
   const maxRevisions = ctx.config.maxRevisions ?? 2
   const tokenCap = ctx.config.maxTotalTokens
 
-  await callPersistence('onRunStart', {
-    runId,
-    startedAt,
-    status: 'executing',
-    input,
-    history,
-    plan: currentPlan,
-    trace,
-    usage: totalUsage,
-  })
+  // Skip onRunStart on resume - the original run already fired it. We don't
+  // want consumers seeing two starts for the same runId.
+  if (!resumed) {
+    await callPersistence('onRunStart', {
+      runId,
+      startedAt,
+      status: 'executing',
+      input,
+      history,
+      plan: currentPlan,
+      trace,
+      usage: totalUsage,
+      stepIndex,
+      iterations,
+      revisions,
+    })
+  }
+
+  // Capture the post-iteration "next loop entry" state. Called at every
+  // iteration boundary (clean continue / replan continue / replan revise);
+  // crash recovery from the last checkpoint resumes at exactly the saved
+  // stepIndex / currentPlan / trace, with no re-execution of completed steps.
+  const persistCheckpoint = async (): Promise<void> => {
+    await callPersistence('onStepComplete', {
+      runId,
+      startedAt,
+      status: 'executing',
+      input,
+      history,
+      plan: currentPlan,
+      trace,
+      usage: totalUsage,
+      stepIndex,
+      iterations,
+      revisions,
+    })
+  }
 
   while (iterations < ctx.config.maxIterations) {
     iterations++
@@ -247,6 +338,9 @@ const runAgentLoopInner = async (
           plan: currentPlan,
           trace,
           usage: totalUsage,
+          stepIndex: trace.length,
+          iterations,
+          revisions,
           error: (err as Error).message,
           completedAt: Date.now(),
         })
@@ -276,6 +370,9 @@ const runAgentLoopInner = async (
           plan: currentPlan,
           trace,
           usage: totalUsage,
+          stepIndex: trace.length,
+          iterations,
+          revisions,
           error: (err as Error).message,
           completedAt: Date.now(),
         })
@@ -284,16 +381,10 @@ const runAgentLoopInner = async (
     }
     trace.push(result)
     proxiedCtx.emit({ type: 'step.complete', step, result })
-    await callPersistence('onStepComplete', {
-      runId,
-      startedAt,
-      status: 'executing',
-      input,
-      history,
-      plan: currentPlan,
-      trace,
-      usage: totalUsage,
-    })
+    // Persistence checkpoint is intentionally NOT called here. It fires at
+    // the END of the iteration (after the replanner decision) so the
+    // serialized stepIndex / currentPlan reflect a stable next-loop-entry
+    // state. See the three persistCheckpoint() calls below.
 
     const nextStep = currentPlan.steps[stepIndex + 1] ?? null
     const isLastPlannedStep = nextStep === null
@@ -316,6 +407,7 @@ const runAgentLoopInner = async (
         cause: 'clean-step',
       })
       stepIndex++
+      await persistCheckpoint()
       continue
     }
 
@@ -333,6 +425,9 @@ const runAgentLoopInner = async (
         plan: currentPlan,
         trace,
         usage: totalUsage,
+        stepIndex,
+        iterations,
+        revisions,
         error: (err as Error).message,
         completedAt: Date.now(),
       })
@@ -357,9 +452,11 @@ const runAgentLoopInner = async (
       currentPlan = decision.newPlan
       proxiedCtx.emit({ type: 'plan.revised', plan: currentPlan, reason: decision.reason })
       stepIndex = 0
+      await persistCheckpoint()
       continue
     }
     stepIndex++
+    await persistCheckpoint()
   }
 
   let text: string
@@ -376,6 +473,9 @@ const runAgentLoopInner = async (
       plan: currentPlan,
       trace,
       usage: totalUsage,
+      stepIndex,
+      iterations,
+      revisions,
       error: (err as Error).message,
       completedAt: Date.now(),
     })
@@ -391,6 +491,9 @@ const runAgentLoopInner = async (
     plan: currentPlan,
     trace,
     usage: totalUsage,
+    stepIndex,
+    iterations,
+    revisions,
     text,
     completedAt: Date.now(),
   })

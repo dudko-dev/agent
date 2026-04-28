@@ -85,6 +85,34 @@ await agent.run({
 })
 ```
 
+### Resume after crash
+
+Wire a persistence adapter that implements `loadRun(runId)`, then resume with the run id:
+
+```ts
+import { makeSqlitePersistence } from './examples/persistence-sqlite.ts'
+
+const persistence = makeSqlitePersistence('./runs.db')
+const agent = await createAgent({ ..., persistence, keepSandbox: true })
+
+try {
+  await agent.run({ input: '...' })
+} catch (err) {
+  // process crashed mid-run; the snapshot has the latest checkpoint.
+}
+
+// Later, in a new process:
+await agent.run({ input: '', resumeFromRunId: '<saved-run-id>' })
+```
+
+Caveats:
+
+- **Idempotency.** Resume re-enters the loop at the saved checkpoint (the iteration boundary after the last successful step). A crash mid-step means the in-flight step's tool calls are lost; on resume, the runner re-executes that step from scratch. If your tools have side effects (writes, payments, emails), the same call may fire twice. Design tools to be idempotent or guard against replay.
+- **Sandbox.** The per-run sandbox directory is auto-cleaned on completion. To resume, set `keepSandbox: true` so files written by earlier steps survive the crash. Without it, the trace's file references will point to a directory that no longer exists.
+- **Plan changes.** The saved `currentPlan` (post any revise) is what gets used on resume — the planner is not re-invoked.
+- **Caps inherit.** `iterations` and `revisions` carry over, so per-run caps still apply across the boundary.
+- **Terminal status.** Resuming a run with `status: 'complete'` throws — re-read the saved `text` directly instead.
+
 ### OpenTelemetry
 
 The agent emits OTel spans for `agent.run`, `agent.plan`, `agent.execute_step`, `agent.replan`, and `agent.synthesize` via the `@opentelemetry/api` package. With no SDK installed, the calls are no-ops; install your favorite OTel exporter (jaeger, otlp, console) and you get traces and parent-child relationships out of the box. Span attributes are documented in [`src/tracing.ts`](./src/tracing.ts).
@@ -132,7 +160,7 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 | `systemPrompt` | Appended to the planner, executor, replanner, and synthesizer system prompts so the same domain context (persona, language, tone) reaches every stage. |
 | `failOnNoTools` | When `true`, `createAgent` throws if every configured MCP server failed to connect (otherwise the agent starts with zero tools and emits an `error`-level log). Default `false`. |
 | `maxConcurrentRuns` | Hard cap on concurrent `agent.run()` calls. When reached, further calls reject synchronously. Default: unlimited. Intentionally a throw, not a queue — back-pressure belongs on the caller. |
-| `persistence` | Optional `IPersistence` facade. Receives `IRunSnapshot` at run start, after every step, and at run completion. **Write-only by design** — used for audit / observability / debugging. The agent itself never reads back. Resume-after-crash is not yet supported. See [`examples/persistence-sqlite.ts`](./examples/persistence-sqlite.ts). |
+| `persistence` | Optional `IPersistence` facade. Receives `IRunSnapshot` at run start, at every iteration boundary, and at run completion. Implementing the optional `loadRun(runId)` enables resume via `agent.run({ resumeFromRunId })`. See [`examples/persistence-sqlite.ts`](./examples/persistence-sqlite.ts) for a `node:sqlite`-backed adapter. |
 | `logLevel` | `'none' \| 'error' \| 'warn' \| 'info' \| 'debug'` |
 
 ## API

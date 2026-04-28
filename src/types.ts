@@ -226,11 +226,20 @@ export interface IStepStartInfo {
 }
 
 export interface IAgentRunOptions {
+  // Required for fresh runs; ignored when resumeFromRunId is set (the
+  // snapshot's input wins so the resumed run is deterministic against the
+  // original prompt).
   input: string
   history?: IConversationTurn[]
   signal?: AbortSignal
   onEvent?: EventHandler
   onStepStart?: (info: IStepStartInfo) => void
+  // Resume a previously persisted run. Requires config.persistence.loadRun
+  // to be implemented and the snapshot to be in a non-terminal state (i.e.
+  // not 'complete'). The runner re-uses the saved runId, plan, trace, and
+  // counters; the saved sandbox dir is recreated lazily but its prior
+  // contents are gone unless keepSandbox was true on the original run.
+  resumeFromRunId?: string
 }
 
 export interface IAgentRunResult {
@@ -244,6 +253,11 @@ export interface IAgentRunResult {
 // Snapshot of a run handed to IPersistence hooks. Each hook receives the
 // fields most relevant at its lifecycle point; consumers should treat these
 // as read-only.
+//
+// Resume semantics: stepIndex / iterations / revisions are the loop counters
+// at the moment the snapshot was taken. On resume, the runner picks up at
+// trace.length and inherits iterations/revisions so the per-run caps still
+// apply across crashes.
 export interface IRunSnapshot {
   runId: string
   startedAt: number
@@ -253,20 +267,32 @@ export interface IRunSnapshot {
   plan?: IPlan
   trace: IStepResult[]
   usage: IUsage
+  // Loop counters at snapshot time. iterations counts every executed step
+  // (including those replaced by a revise), revisions counts replan revises.
+  // stepIndex is the NEXT step index to execute within `plan.steps`; on
+  // resume it should equal trace.length when the saved plan is still in play.
+  stepIndex: number
+  iterations: number
+  revisions: number
   text?: string
   error?: string
   completedAt?: number
 }
 
-// Optional persistence facade. Hooks fire at run start, after each step, and
-// at run completion. Implementations decide what (if anything) to durably
-// store - the agent itself never reads the data back.
+// Optional persistence facade. Write hooks fire at run start, after each
+// step, and at run completion. Implementations decide what (if anything) to
+// durably store. loadRun is consulted only when the caller asks for a resume
+// via IAgentRunOptions.resumeFromRunId.
 //
-// All hooks may be async; the agent awaits them so a slow store back-pressures
-// the run. Throws are caught and logged at warn level - persistence failures
-// must NEVER crash a run.
+// Write hooks: errors are caught and logged at warn level - persistence
+// failures must NEVER crash a run. Reads in loadRun, by contrast, propagate
+// to the caller (a missing snapshot is a configuration / programmer error).
 export interface IPersistence {
   onRunStart?: (snapshot: IRunSnapshot) => void | Promise<void>
   onStepComplete?: (snapshot: IRunSnapshot) => void | Promise<void>
   onRunComplete?: (snapshot: IRunSnapshot) => void | Promise<void>
+  // Optional read hook used by agent.run({ resumeFromRunId }). Returns the
+  // saved snapshot, or null when not found. Implementations that don't want
+  // to support resume can simply omit this method.
+  loadRun?: (runId: string) => IRunSnapshot | null | Promise<IRunSnapshot | null>
 }
