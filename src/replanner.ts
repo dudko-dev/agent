@@ -2,7 +2,7 @@ import { generateObject } from 'ai'
 import { z } from 'zod'
 import type { IAgentInternalContext } from './internal.ts'
 import { PlanSchema } from './planner.ts'
-import { REPLANNER_SYSTEM, buildReplannerUserPrompt } from './prompts.ts'
+import { REPLANNER_SYSTEM, buildReplannerUserPrompt, withDomainContext } from './prompts.ts'
 import type { IPlan, IPlanStep, IStepResult, IUsage } from './types.ts'
 import { withRetry, withTimeout } from './utils.ts'
 
@@ -39,7 +39,7 @@ export const decideNextAction = async (
       const r = await generateObject({
         model: ctx.plannerModel,
         schema: DecisionSchema,
-        system: REPLANNER_SYSTEM,
+        system: withDomainContext(REPLANNER_SYSTEM, ctx.config.systemPrompt),
         prompt: buildReplannerUserPrompt(
           input,
           plan,

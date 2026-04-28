@@ -6,6 +6,7 @@ import {
   renderHistory,
   renderToolCatalog,
   renderTrace,
+  withDomainContext,
 } from '../src/prompts.ts'
 import type { IStepResult } from '../src/types.ts'
 
@@ -86,4 +87,14 @@ test('buildPlannerSystem appends narrowed addendum only in compact mode', () => 
 
 test('EXECUTOR_SYSTEM mentions the [BLOCKER] sentinel for downstream replanner', () => {
   assert.match(EXECUTOR_SYSTEM, /\[BLOCKER\]/)
+})
+
+test('withDomainContext returns the base prompt unchanged when systemPrompt is empty', () => {
+  assert.equal(withDomainContext('BASE', undefined), 'BASE')
+  assert.equal(withDomainContext('BASE', ''), 'BASE')
+})
+
+test('withDomainContext appends user systemPrompt under a Domain context header', () => {
+  const out = withDomainContext('BASE', 'Reply in Russian.')
+  assert.equal(out, 'BASE\n\nDomain context:\nReply in Russian.')
 })

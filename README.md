@@ -100,7 +100,7 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 | `llmTimeoutMs` / `llmMaxRetries` | Per-LLM-call timeout and retry budget. |
 | `toolSelectionStrategy` | `'all'` (default) gives the executor every tool each step; `'plan-narrowed'` exposes only `step.suggestedTools`. |
 | `outputSanitizer` | Optional `(toolName, output) => unknown` hook to redact tool results before they reach the LLM. |
-| `systemPrompt` | Appended to the executor system prompt. |
+| `systemPrompt` | Appended to the planner, executor, replanner, and synthesizer system prompts so the same domain context (persona, language, tone) reaches every stage. |
 | `failOnNoTools` | When `true`, `createAgent` throws if every configured MCP server failed to connect (otherwise the agent starts with zero tools and emits an `error`-level log). Default `false`. |
 | `logLevel` | `'none' \| 'error' \| 'warn' \| 'info' \| 'debug'` |
 

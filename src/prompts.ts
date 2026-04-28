@@ -96,6 +96,13 @@ export const renderPlan = (plan: IPlan): string =>
     ),
   ].join('\n')
 
+// Append the user-supplied domain context to a system prompt. Applied
+// uniformly to all four stages (planner, executor, replanner, synthesizer)
+// so e.g. "answer in Russian" or persona instructions reach the user-facing
+// synthesizer too, not just planner+executor.
+export const withDomainContext = (base: string, systemPrompt: string | undefined): string =>
+  systemPrompt ? `${base}\n\nDomain context:\n${systemPrompt}` : base
+
 export const PLANNER_SYSTEM_BASE = `You are the Planner of a multi-step agent system.
 
 Your only job is to decompose the user's request into a short ordered list of concrete actionable steps that a tool-using Executor can perform one at a time.

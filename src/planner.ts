@@ -1,7 +1,12 @@
 import { streamObject } from 'ai'
 import { z } from 'zod'
 import type { IAgentInternalContext } from './internal.ts'
-import { buildPlannerSystem, buildPlannerUserPrompt, type CatalogMode } from './prompts.ts'
+import {
+  buildPlannerSystem,
+  buildPlannerUserPrompt,
+  withDomainContext,
+  type CatalogMode,
+} from './prompts.ts'
 import type { IConversationTurn, IPlan, IUsage } from './types.ts'
 import { withRetry, withTimeout } from './utils.ts'
 
@@ -83,9 +88,7 @@ const streamPlanOnce = async (
   const result = streamObject({
     model: ctx.plannerModel,
     schema: PlanSchema,
-    system: ctx.config.systemPrompt
-      ? `${buildPlannerSystem(catalogMode)}\n\nDomain context:\n${ctx.config.systemPrompt}`
-      : buildPlannerSystem(catalogMode),
+    system: withDomainContext(buildPlannerSystem(catalogMode), ctx.config.systemPrompt),
     prompt: buildPlannerUserPrompt(input, ctx.toolCatalog, history, catalogMode),
     abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
   })

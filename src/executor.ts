@@ -1,6 +1,6 @@
 import { stepCountIs, streamText, type ToolSet } from 'ai'
 import type { IAgentInternalContext } from './internal.ts'
-import { EXECUTOR_SYSTEM, buildExecutorUserPrompt } from './prompts.ts'
+import { EXECUTOR_SYSTEM, buildExecutorUserPrompt, withDomainContext } from './prompts.ts'
 import type { IConversationTurn, IPlan, IPlanStep, IStepResult, IUsage } from './types.ts'
 import { withRetry, withTimeout } from './utils.ts'
 
@@ -112,9 +112,7 @@ const runOnce = async (
     // copy of every key, equivalent to omitting the field.
     ...(narrowed ? { activeTools: Object.keys(activeTools) } : {}),
     stopWhen: stepCountIs(ctx.config.maxStepsPerTask),
-    system: ctx.config.systemPrompt
-      ? `${EXECUTOR_SYSTEM}\n\nDomain context:\n${ctx.config.systemPrompt}`
-      : EXECUTOR_SYSTEM,
+    system: withDomainContext(EXECUTOR_SYSTEM, ctx.config.systemPrompt),
     prompt: buildExecutorUserPrompt(input, plan, step, trace, history),
     abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
   })

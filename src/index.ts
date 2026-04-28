@@ -90,12 +90,17 @@ export const createAgent = async (
     }
   }
 
+  // Forward declaration: connectMcpServers needs the onToolsChanged callback,
+  // and the callback must enqueue refreshes that drain only when activeRuns
+  // reaches zero. We set the impl after the run/close machinery is wired up.
+  let onToolsChanged: ((server: string) => void) | undefined
   const connect = async () => {
     const c = await connectMcpServers(
       config.mcpServers,
       log,
       config.clientName,
       config.outputSanitizer,
+      (server) => onToolsChanged?.(server),
     )
     const f = filterTools(c.tools, c.catalog, config.availableTools, config.excludedTools)
     return { connection: c, tools: f.tools, catalog: f.catalog }
@@ -153,6 +158,66 @@ export const createAgent = async (
   let activeRuns = 0
   let closed = false
   let reconnecting = false
+  let refreshing = false
+  // Server names whose tools/list_changed has fired but whose refresh is
+  // deferred because activeRuns > 0 or another lifecycle op is in flight.
+  const pendingRefreshes = new Set<string>()
+
+  const applyRefresh = async (server: string): Promise<void> => {
+    await connected.connection.refreshServer(server)
+    // Re-apply the availableTools/excludedTools filter to the freshly mutated
+    // raw maps, then mutate ctx.tools in place so existing closures pick up
+    // the new set. The synchronous delete+assign block runs without awaits,
+    // so no run() can interleave once activeRuns has been gated to 0.
+    const f = filterTools(
+      connected.connection.tools,
+      connected.connection.catalog,
+      config.availableTools,
+      config.excludedTools,
+    )
+    for (const k of Object.keys(ctx.tools)) {
+      delete ctx.tools[k]
+    }
+    Object.assign(ctx.tools, f.tools)
+    ctx.toolCatalog = f.catalog.map((c) => ({ name: c.name, description: c.description }))
+    log(
+      'info',
+      `[mcp] ${server}: tool list refreshed (${f.catalog.length} tools total after filter)`,
+    )
+  }
+
+  const drainPendingRefreshes = async (): Promise<void> => {
+    if (refreshing || closed || reconnecting) {
+      return
+    }
+    if (activeRuns > 0 || pendingRefreshes.size === 0) {
+      return
+    }
+    refreshing = true
+    try {
+      while (pendingRefreshes.size > 0 && activeRuns === 0 && !closed && !reconnecting) {
+        const next = pendingRefreshes.values().next().value as string
+        pendingRefreshes.delete(next)
+        try {
+          await applyRefresh(next)
+        } catch (err) {
+          log('warn', `[mcp] ${next}: refresh failed - ${(err as Error).message}`)
+        }
+      }
+    } finally {
+      refreshing = false
+    }
+  }
+
+  // Wired up here so the closure captures the lifecycle flags and
+  // pendingRefreshes set declared above.
+  onToolsChanged = (server: string) => {
+    pendingRefreshes.add(server)
+    // Sync entry into drainPendingRefreshes runs to the first await before
+    // returning, so the refreshing/activeRuns gating is observed atomically
+    // from any run() call that lands after this notification.
+    void drainPendingRefreshes()
+  }
 
   return {
     run: async (options: IAgentRunOptions) => {
@@ -166,11 +231,18 @@ export const createAgent = async (
       if (reconnecting) {
         throw new Error('Agent is reconnecting; retry shortly')
       }
+      if (refreshing) {
+        throw new Error('Agent is refreshing tools; retry shortly')
+      }
       activeRuns++
       try {
         return await runAgentLoop(ctx, options)
       } finally {
         activeRuns--
+        // Drain deferred tool refreshes once we go quiescent. Fire-and-forget:
+        // the next caller of run() either sees the refresh applied or gets
+        // the 'refreshing' rejection and retries.
+        void drainPendingRefreshes()
       }
     },
     listTools: () => ctx.toolCatalog.slice(),
@@ -181,12 +253,19 @@ export const createAgent = async (
       if (reconnecting) {
         throw new Error('Already reconnecting')
       }
+      if (refreshing) {
+        throw new Error('Agent is refreshing tools; retry shortly')
+      }
       if (activeRuns > 0) {
         throw new Error(`Cannot reconnect with ${activeRuns} active run(s)`)
       }
       reconnecting = true
       try {
         const oldConnection = connected.connection
+        // Drop any deferred per-server refreshes - the new connection comes
+        // up with a fresh tool listing and its own subscriptions, so the
+        // pending entries are stale and would only re-trigger work.
+        pendingRefreshes.clear()
         const fresh = await connect()
         // Mutate ctx.tools in place so existing closures pick up new tools.
         // The reconnecting flag held above blocks new run() calls during the

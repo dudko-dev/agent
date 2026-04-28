@@ -1,6 +1,6 @@
 import { streamText } from 'ai'
 import type { IAgentInternalContext } from './internal.ts'
-import { SYNTHESIZER_SYSTEM, buildSynthesizerUserPrompt } from './prompts.ts'
+import { SYNTHESIZER_SYSTEM, buildSynthesizerUserPrompt, withDomainContext } from './prompts.ts'
 import type { IConversationTurn, IPlan, IStepResult, IUsage } from './types.ts'
 import { withRetry, withTimeout } from './utils.ts'
 
@@ -35,7 +35,7 @@ const streamOnce = async (
 ): Promise<{ text: string; usage: IUsage }> => {
   const result = streamText({
     model: ctx.synthesizerModel,
-    system: SYNTHESIZER_SYSTEM,
+    system: withDomainContext(SYNTHESIZER_SYSTEM, ctx.config.systemPrompt),
     prompt: buildSynthesizerUserPrompt(input, plan, trace, history),
     abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
   })
