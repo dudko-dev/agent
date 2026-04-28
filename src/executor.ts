@@ -104,6 +104,28 @@ const runOnce = async (
   const activeTools = buildActiveToolSet(ctx, step)
   const narrowed = ctx.config.toolSelectionStrategy === 'plan-narrowed'
 
+  const sanitizeForEvent = async (toolName: string, raw: unknown): Promise<unknown> => {
+    const fn = ctx.config.inputSanitizer
+    if (!fn) {
+      return raw
+    }
+    try {
+      return await fn(toolName, raw)
+    } catch (err) {
+      // Mirror the mcp.ts policy: a buggy sanitizer must not leak the raw
+      // input through the event channel. We log once and keep the run going
+      // with a placeholder; the executor will get a deterministic error from
+      // the MCP wrapper (which also runs the sanitizer and bails to the
+      // same placeholder).
+      ctx.emit({
+        type: 'log',
+        level: 'warn',
+        message: `[executor] inputSanitizer threw for ${toolName} - ${(err as Error).message}; event input redacted`,
+      })
+      return '[input redacted: sanitizer failed]'
+    }
+  }
+
   const result = streamText({
     model: ctx.executorModel,
     tools: activeTools,
@@ -125,15 +147,20 @@ const runOnce = async (
         }
         break
       case 'tool-call': {
-        toolInputs.set(part.toolCallId, { name: part.toolName, input: part.input })
-        ctx.emit({ type: 'step.tool-call', step, name: part.toolName, input: part.input })
+        const sanitizedInput = await sanitizeForEvent(part.toolName, part.input)
+        toolInputs.set(part.toolCallId, { name: part.toolName, input: sanitizedInput })
+        ctx.emit({ type: 'step.tool-call', step, name: part.toolName, input: sanitizedInput })
         break
       }
       case 'tool-result': {
         const known = toolInputs.get(part.toolCallId)
+        // Fallback path is defensive (tool-result before tool-call should
+        // not happen). Sanitize the raw fallback input so an out-of-order
+        // event still doesn't leak secrets.
+        const recordedInput = known?.input ?? (await sanitizeForEvent(part.toolName, part.input))
         toolCalls.push({
           name: part.toolName,
-          input: known?.input ?? part.input,
+          input: recordedInput,
           output: part.output,
           ok: true,
         })
@@ -149,9 +176,10 @@ const runOnce = async (
       }
       case 'tool-error': {
         const known = toolInputs.get(part.toolCallId)
+        const recordedInput = known?.input ?? (await sanitizeForEvent(part.toolName, part.input))
         toolCalls.push({
           name: part.toolName,
-          input: known?.input ?? part.input,
+          input: recordedInput,
           output: part.error,
           ok: false,
         })

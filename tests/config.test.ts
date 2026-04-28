@@ -103,10 +103,30 @@ test('loadConfig rejects malformed MCP_SERVERS JSON', () => {
   assert.throws(() => loadConfig(), /MCP_SERVERS/)
 })
 
-test('loadConfig rejects MCP_SERVERS entry without url', () => {
+test('loadConfig rejects MCP_SERVERS entry without url or command', () => {
   setMinimalOpenAi()
   process.env.MCP_SERVERS = JSON.stringify({ docs: { headers: {} } })
-  assert.throws(() => loadConfig(), /MCP_SERVERS\.docs\.url/)
+  assert.throws(() => loadConfig(), /must specify "url" .*"command"/)
+})
+
+test('loadConfig parses MCP_SERVERS stdio config (command + args + env)', () => {
+  setMinimalOpenAi()
+  process.env.MCP_SERVERS = JSON.stringify({
+    fs: { command: '/usr/local/bin/mcp-fs', args: ['--root', '/tmp'], env: { DEBUG: '1' } },
+  })
+  const c = loadConfig()
+  const fs = c.mcpServers.fs as { command: string; args: string[]; env: Record<string, string> }
+  assert.equal(fs.command, '/usr/local/bin/mcp-fs')
+  assert.deepEqual(fs.args, ['--root', '/tmp'])
+  assert.deepEqual(fs.env, { DEBUG: '1' })
+})
+
+test('loadConfig rejects MCP_SERVERS entry that mixes url and command', () => {
+  setMinimalOpenAi()
+  process.env.MCP_SERVERS = JSON.stringify({
+    weird: { url: 'http://x', command: '/bin/x' },
+  })
+  assert.throws(() => loadConfig(), /not both/)
 })
 
 test('loadConfig parses CSV tool lists, trimming and dropping empties', () => {

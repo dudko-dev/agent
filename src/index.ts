@@ -11,7 +11,7 @@ import type {
   LogLevel,
 } from './types.ts'
 
-export { getCurrentRunId } from './context.ts'
+export { getCurrentRunId, getCurrentRunSandbox } from './context.ts'
 export { redactHeaders } from './utils.ts'
 
 export type {
@@ -21,7 +21,9 @@ export type {
   IAgentRunOptions,
   IAgentRunResult,
   IConversationTurn,
+  IMcpHttpServerConfig,
   IMcpServerConfig,
+  IMcpStdioServerConfig,
   IPlan,
   IPlanStep,
   IStepResult,
@@ -94,6 +96,53 @@ export const createAgent = async (
   // and the callback must enqueue refreshes that drain only when activeRuns
   // reaches zero. We set the impl after the run/close machinery is wired up.
   let onToolsChanged: ((server: string) => void) | undefined
+  // Merge native tools (config.tools) into a freshly filtered MCP view.
+  // Called both at startup and after a tools/list_changed refresh, so native
+  // entries survive MCP catalog rebuilds.
+  const mergeNativeTools = (
+    f: {
+      tools: ReturnType<typeof filterTools>['tools']
+      catalog: ReturnType<typeof filterTools>['catalog']
+    },
+    onCollision: (name: string) => never,
+  ): {
+    tools: ReturnType<typeof filterTools>['tools']
+    catalog: ReturnType<typeof filterTools>['catalog']
+  } => {
+    if (!config.tools) {
+      return f
+    }
+    const nativeCatalog: ReturnType<typeof filterTools>['catalog'] = []
+    for (const [name, tool] of Object.entries(config.tools)) {
+      if (f.tools[name]) {
+        onCollision(name)
+      }
+      // availableTools wins over native registration, mirroring the MCP
+      // path: an explicit allowlist excludes everything not on it.
+      if (config.availableTools?.length && !config.availableTools.includes(name)) {
+        continue
+      }
+      if (
+        !config.availableTools?.length &&
+        config.excludedTools?.length &&
+        config.excludedTools.includes(name)
+      ) {
+        continue
+      }
+      f.tools[name] = tool
+      const rawDesc =
+        typeof tool === 'object' && tool && 'description' in tool
+          ? (tool as { description?: unknown }).description
+          : ''
+      nativeCatalog.push({
+        name,
+        description: typeof rawDesc === 'string' ? rawDesc : '',
+        server: '<native>',
+      })
+    }
+    return { tools: f.tools, catalog: [...f.catalog, ...nativeCatalog] }
+  }
+
   const connect = async () => {
     const c = await connectMcpServers(
       config.mcpServers,
@@ -101,9 +150,16 @@ export const createAgent = async (
       config.clientName,
       config.outputSanitizer,
       (server) => onToolsChanged?.(server),
+      config.inputSanitizer,
     )
     const f = filterTools(c.tools, c.catalog, config.availableTools, config.excludedTools)
-    return { connection: c, tools: f.tools, catalog: f.catalog }
+    const merged = mergeNativeTools(f, (name) => {
+      // Tear the connection down so we don't leak open MCP transports when
+      // the caller's misconfiguration crashes startup.
+      void c.close().catch(() => {})
+      throw new Error(`Native tool "${name}" collides with an MCP-registered tool of the same name`)
+    })
+    return { connection: c, tools: merged.tools, catalog: merged.catalog }
   }
 
   let connected: Awaited<ReturnType<typeof connect>>
@@ -175,14 +231,20 @@ export const createAgent = async (
       config.availableTools,
       config.excludedTools,
     )
+    // Native tools must be merged back in: filterTools/refreshServer only
+    // produce the MCP view, so without this they'd vanish from ctx.tools
+    // until the next reconnect.
+    const merged = mergeNativeTools(f, (name) => {
+      throw new Error(`Native tool "${name}" collides with an MCP-registered tool of the same name`)
+    })
     for (const k of Object.keys(ctx.tools)) {
       delete ctx.tools[k]
     }
-    Object.assign(ctx.tools, f.tools)
-    ctx.toolCatalog = f.catalog.map((c) => ({ name: c.name, description: c.description }))
+    Object.assign(ctx.tools, merged.tools)
+    ctx.toolCatalog = merged.catalog.map((c) => ({ name: c.name, description: c.description }))
     log(
       'info',
-      `[mcp] ${server}: tool list refreshed (${f.catalog.length} tools total after filter)`,
+      `[mcp] ${server}: tool list refreshed (${merged.catalog.length} tools total after filter)`,
     )
   }
 

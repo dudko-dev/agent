@@ -111,22 +111,57 @@ const parseMcpServers = (raw: string | undefined): Record<string, IMcpServerConf
     throw new Error(`MCP_SERVERS must be valid JSON: ${(err as Error).message}`)
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('MCP_SERVERS must be a JSON object: Record<name, { url, headers? }>')
+    throw new Error(
+      'MCP_SERVERS must be a JSON object: Record<name, { url, headers? } | { command, args?, env?, cwd? }>',
+    )
   }
   const result: Record<string, IMcpServerConfig> = {}
   for (const [name, value] of Object.entries(parsed as Record<string, unknown>)) {
     if (!value || typeof value !== 'object') {
       throw new Error(`MCP_SERVERS.${name} must be an object`)
     }
-    const v = value as { url?: unknown; headers?: unknown }
-    if (typeof v.url !== 'string' || !v.url) {
-      throw new Error(`MCP_SERVERS.${name}.url must be a non-empty string`)
+    const v = value as {
+      url?: unknown
+      headers?: unknown
+      command?: unknown
+      args?: unknown
+      env?: unknown
+      cwd?: unknown
     }
-    const headers =
-      v.headers && typeof v.headers === 'object' && !Array.isArray(v.headers)
-        ? (v.headers as Record<string, string>)
-        : undefined
-    result[name] = { url: v.url, headers }
+    const hasUrl = typeof v.url === 'string' && v.url.length > 0
+    const hasCommand = typeof v.command === 'string' && v.command.length > 0
+    if (hasUrl && hasCommand) {
+      throw new Error(
+        `MCP_SERVERS.${name}: specify either "url" (HTTP) or "command" (stdio), not both`,
+      )
+    }
+    if (!hasUrl && !hasCommand) {
+      throw new Error(`MCP_SERVERS.${name}: must specify "url" (HTTP) or "command" (stdio)`)
+    }
+    if (hasUrl) {
+      const headers =
+        v.headers && typeof v.headers === 'object' && !Array.isArray(v.headers)
+          ? (v.headers as Record<string, string>)
+          : undefined
+      result[name] = { url: v.url as string, headers }
+      continue
+    }
+    // stdio path
+    if (v.args !== undefined && !Array.isArray(v.args)) {
+      throw new Error(`MCP_SERVERS.${name}.args must be a string array`)
+    }
+    if (v.env !== undefined && (!v.env || typeof v.env !== 'object' || Array.isArray(v.env))) {
+      throw new Error(`MCP_SERVERS.${name}.env must be a string-to-string map`)
+    }
+    if (v.cwd !== undefined && typeof v.cwd !== 'string') {
+      throw new Error(`MCP_SERVERS.${name}.cwd must be a string`)
+    }
+    result[name] = {
+      command: v.command as string,
+      args: v.args as string[] | undefined,
+      env: v.env as Record<string, string> | undefined,
+      cwd: v.cwd as string | undefined,
+    }
   }
   return result
 }

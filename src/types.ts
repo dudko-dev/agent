@@ -1,3 +1,5 @@
+import type { ToolSet } from 'ai'
+
 export type ProviderType = 'openai' | 'anthropic' | 'openai-compatible' | 'google'
 
 export type LogLevel = 'none' | 'error' | 'warn' | 'info' | 'debug'
@@ -9,7 +11,8 @@ export type LogLevel = 'none' | 'error' | 'warn' | 'info' | 'debug'
 //                   needs tools; empty means "reasoning-only step".
 export type ToolSelectionStrategy = 'all' | 'plan-narrowed'
 
-export interface IMcpServerConfig {
+// Remote MCP server reached over StreamableHTTP/SSE.
+export interface IMcpHttpServerConfig {
   url: string
   headers?: Record<string, string>
   // Called at connect time (and on reconnect) to provide fresh request headers.
@@ -17,6 +20,20 @@ export interface IMcpServerConfig {
   // an expired Bearer.
   getHeaders?: () => Promise<Record<string, string>> | Record<string, string>
 }
+
+// Local MCP server spawned as a child process. The transport speaks JSON-RPC
+// over the process's stdin/stdout. `stderr` of the child is inherited by
+// default so server logs are visible in the agent's terminal.
+export interface IMcpStdioServerConfig {
+  command: string
+  args?: string[]
+  env?: Record<string, string>
+  cwd?: string
+}
+
+// Discriminated union: callers pick HTTP or stdio per server. Existing
+// callers passing { url, headers? } typecheck unchanged as IMcpHttpServerConfig.
+export type IMcpServerConfig = IMcpHttpServerConfig | IMcpStdioServerConfig
 
 export interface IAgentConfig {
   clientName: string
@@ -29,6 +46,11 @@ export interface IAgentConfig {
   plannerModel?: string
   synthesizerModel?: string
   mcpServers: Record<string, IMcpServerConfig>
+  // Native AI-SDK tools registered alongside MCP-discovered tools. Names
+  // must not collide with any MCP-prefixed tool ("server__tool"); createAgent
+  // throws on conflict. Native tools bypass outputSanitizer/inputSanitizer
+  // since the caller already controls their implementation.
+  tools?: ToolSet
   availableTools?: string[]
   excludedTools?: string[]
   // Cap on executed steps across the run (every step counts, including those
@@ -44,9 +66,30 @@ export interface IAgentConfig {
   llmTimeoutMs?: number
   llmMaxRetries?: number
   toolSelectionStrategy?: ToolSelectionStrategy
+  // Sanitize an input the LLM passed to a tool BEFORE the call is dispatched
+  // and BEFORE the step.tool-call event is emitted. Use to redact secrets the
+  // model may have copied from prior context (auth tokens, PII) so they don't
+  // reach external services or event consumers / log sinks.
+  //
+  // CONTRACT: must be IDEMPOTENT. The sanitizer is applied twice per call -
+  // once in the executor before event emission, once in the MCP wrapper
+  // before dispatch - so calling f(f(x)) must equal f(x). Typical
+  // implementations (regex redaction, key stripping, value masking) satisfy
+  // this naturally. Throwing replaces the input with a safe placeholder string
+  // and the call proceeds, so the model sees a deterministic failure rather
+  // than a hang.
+  inputSanitizer?: (toolName: string, input: unknown) => unknown | Promise<unknown>
   outputSanitizer?: (toolName: string, output: unknown) => unknown | Promise<unknown>
   logLevel: LogLevel
   systemPrompt?: string
+  // Root directory for per-run sandbox subdirs. Each agent.run() call gets
+  // its own <sandboxRoot>/<runId>/ folder, created lazily the first time a
+  // tool writes a binary blob. Defaults to <os.tmpdir()>/agent-sandbox.
+  // Tools (native or via MCP) can reach the directory via getCurrentRunSandbox().
+  sandboxRoot?: string
+  // When true, the per-run sandbox directory is NOT removed after the run
+  // completes. Useful for debugging or post-run inspection. Default false.
+  keepSandbox?: boolean
   // When true, createAgent throws if every configured MCP server failed to
   // connect (i.e. the agent would start with zero tools). Defaults to false:
   // the agent starts and the failure is surfaced via 'log' events at error

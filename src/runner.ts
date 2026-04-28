@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto'
+import { rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { runContext } from './context.ts'
 import { executeStep } from './executor.ts'
 import { createInitialPlan } from './planner.ts'
@@ -33,12 +36,32 @@ export const shouldCallReplanner = (result: IStepResult): boolean => {
 const isAbortError = (err: unknown): boolean =>
   Boolean(err) && typeof err === 'object' && (err as { name?: string }).name === 'AbortError'
 
+// Resolved here (not in context.ts) so the path policy lives next to the
+// runAgentLoop that creates it on demand and tears it down at the end.
+const resolveSandboxDir = (ctx: IAgentInternalContext, runId: string): string => {
+  const root = ctx.config.sandboxRoot?.trim() || path.join(tmpdir(), 'agent-sandbox')
+  return path.join(root, runId)
+}
+
 export const runAgentLoop = async (
   ctx: IAgentInternalContext,
   options: IAgentRunOptions,
 ): Promise<IAgentRunResult> => {
   const runId = randomUUID()
-  return runContext.run({ runId, startedAt: Date.now() }, () => runAgentLoopInner(ctx, options))
+  const sandboxDir = resolveSandboxDir(ctx, runId)
+  return runContext.run({ runId, startedAt: Date.now(), sandboxDir }, async () => {
+    try {
+      return await runAgentLoopInner(ctx, options)
+    } finally {
+      // Best-effort cleanup. If the run never wrote anything, rm with
+      // force:true is a no-op; if it did, we drop the whole subtree. The
+      // catch is intentional - we'd rather leak a temp dir than throw on
+      // teardown and mask the real run result.
+      if (!ctx.config.keepSandbox) {
+        await rm(sandboxDir, { recursive: true, force: true }).catch(() => {})
+      }
+    }
+  })
 }
 
 const runAgentLoopInner = async (

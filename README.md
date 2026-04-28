@@ -91,8 +91,9 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 | `providerType` | `'openai' \| 'anthropic' \| 'google' \| 'openai-compatible'` |
 | `baseURL` | Required for `openai-compatible`; optional for the rest. |
 | `model` / `plannerModel` / `synthesizerModel` | The latter two default to `model`. |
-| `mcpServers` | `Record<name, { url, headers?, getHeaders? }>` |
-| `availableTools` / `excludedTools` | Whitelist / blacklist applied to MCP-discovered tools. |
+| `mcpServers` | `Record<name, { url, headers?, getHeaders? } \| { command, args?, env?, cwd? }>` — HTTP/SSE for remote, stdio for locally-spawned servers. |
+| `tools` | Optional `ToolSet` of native AI-SDK tools registered alongside MCP-discovered ones. Names must not collide with MCP-prefixed names (`createAgent` throws on conflict). |
+| `availableTools` / `excludedTools` | Whitelist / blacklist applied to **all** tools (MCP and native). |
 | `maxIterations` | Cap on **executed steps** across the run (every step counts, including those run after a `revise`). |
 | `maxStepsPerTask` | Cap on LLM steps inside a single executor call (multi-step tool calling). |
 | `maxRevisions` | Cap on `revise` decisions the replanner can make per run. Default `2`. |
@@ -100,6 +101,9 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 | `llmTimeoutMs` / `llmMaxRetries` | Per-LLM-call timeout and retry budget. |
 | `toolSelectionStrategy` | `'all'` (default) gives the executor every tool each step; `'plan-narrowed'` exposes only `step.suggestedTools`. |
 | `outputSanitizer` | Optional `(toolName, output) => unknown` hook to redact tool results before they reach the LLM. |
+| `inputSanitizer` | Optional `(toolName, input) => unknown` hook to redact LLM-generated tool args before they hit the MCP server **and** before they appear in `step.tool-call` events. **Must be idempotent** — applied at both the event boundary and the dispatch boundary. |
+| `sandboxRoot` | Per-run sandbox subdirs are created at `<sandboxRoot>/<runId>/` for tools that spill binary content (images, audio, blob resources). Defaults to `<os.tmpdir()>/agent-sandbox`. |
+| `keepSandbox` | When `true`, the per-run directory is not removed after the run completes. Default `false`. |
 | `systemPrompt` | Appended to the planner, executor, replanner, and synthesizer system prompts so the same domain context (persona, language, tone) reaches every stage. |
 | `failOnNoTools` | When `true`, `createAgent` throws if every configured MCP server failed to connect (otherwise the agent starts with zero tools and emits an `error`-level log). Default `false`. |
 | `logLevel` | `'none' \| 'error' \| 'warn' \| 'info' \| 'debug'` |
@@ -121,6 +125,7 @@ A single agent instance supports concurrent `run()` calls — each gets its own 
 Top-level exports beyond `createAgent`:
 
 - `getCurrentRunId(): string | undefined` — read the active run's id from any code reachable from `agent.run()` (planner, executor, MCP `execute`, retry sleeps, …). Useful for correlating logs/metrics across concurrent runs on a single agent instance.
+- `getCurrentRunSandbox(): string | undefined` — absolute path to the active run's sandbox directory. Native tools that need to spill binary output should write into this path so files are auto-cleaned when the run completes (set `keepSandbox: true` to retain).
 - `redactHeaders(headers)` — small helper for masking `Authorization`, `X-Api-Key`, `Cookie`, etc. when logging request headers (e.g. inside an `outputSanitizer` or your own MCP transport wrapper).
 
 ### Closing the agent
