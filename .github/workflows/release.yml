@@ -49,11 +49,9 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
-          cache: npm
 
       # npm Trusted Publishing requires npm >= 11.5.1. Node 22 LTS still
       # ships npm 10.x, on which the OIDC token exchange silently does not
@@ -105,7 +103,7 @@ jobs:
       #     publish, then switch to TP and remove the secret.
       - name: Publish to npm
         if: steps.check.outputs.publish == 'true'
-        run: npm publish --access public --provenance
+        run: npm publish --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
