@@ -1,6 +1,6 @@
 import type { IAgentInternalContext } from './internal.ts'
 import { connectMcpServers, filterTools } from './mcp.ts'
-import { buildModel } from './provider.ts'
+import { buildModelFromStage, resolveStage } from './provider.ts'
 import { runAgentLoop } from './runner.ts'
 import type {
   AgentEvent,
@@ -20,6 +20,7 @@ export type {
   IAgentConfig,
   IAgentRunOptions,
   IAgentRunResult,
+  IAgentStageOverride,
   IConversationTurn,
   IMcpHttpServerConfig,
   IMcpServerConfig,
@@ -197,9 +198,21 @@ export const createAgent = async (
     }
   }
 
-  const executorModel = buildModel(config, config.model)
-  const plannerModel = buildModel(config, config.plannerModel ?? config.model)
-  const synthesizerModel = buildModel(config, config.synthesizerModel ?? config.model)
+  // Executor always inherits the top-level config; planner / synthesizer can
+  // override any field (provider, baseURL, apiKey, model) via the dedicated
+  // override blocks. Legacy plannerModel / synthesizerModel still work as
+  // model-only shortcuts when the override block is absent.
+  const executorStage = resolveStage(config, undefined, undefined, 'executor')
+  const plannerStage = resolveStage(config, config.planner, config.plannerModel, 'planner')
+  const synthesizerStage = resolveStage(
+    config,
+    config.synthesizer,
+    config.synthesizerModel,
+    'synthesizer',
+  )
+  const executorModel = buildModelFromStage(config.clientName, executorStage)
+  const plannerModel = buildModelFromStage(config.clientName, plannerStage)
+  const synthesizerModel = buildModelFromStage(config.clientName, synthesizerStage)
 
   const ctx: IAgentInternalContext = {
     config,

@@ -1,4 +1,10 @@
-import type { IAgentConfig, IMcpServerConfig, LogLevel, ProviderType } from '../index.ts'
+import type {
+  IAgentConfig,
+  IAgentStageOverride,
+  IMcpServerConfig,
+  LogLevel,
+  ProviderType,
+} from '../index.ts'
 
 const PROVIDERS: readonly ProviderType[] = ['openai', 'anthropic', 'openai-compatible', 'google']
 const LOG_LEVELS: readonly LogLevel[] = ['none', 'error', 'warn', 'info', 'debug']
@@ -30,6 +36,11 @@ export const loadConfig = (): IAgentConfig => {
     baseURL,
     apiKey: required('AGENT_API_KEY'),
     model: required('AGENT_MODEL'),
+    // Per-stage overrides: AGENT_PLANNER_* / AGENT_SYNTHESIZER_*. The legacy
+    // AGENT_PLANNER_MODEL / AGENT_SYNTHESIZER_MODEL still feed the deprecated
+    // top-level model shortcut so existing setups keep working untouched.
+    planner: parseStageOverride('AGENT_PLANNER'),
+    synthesizer: parseStageOverride('AGENT_SYNTHESIZER'),
     plannerModel: process.env.AGENT_PLANNER_MODEL?.trim() || undefined,
     synthesizerModel: process.env.AGENT_SYNTHESIZER_MODEL?.trim() || undefined,
     mcpServers: parseMcpServers(process.env.MCP_SERVERS),
@@ -43,6 +54,30 @@ export const loadConfig = (): IAgentConfig => {
     llmMaxRetries: parseOptionalInt(process.env.AGENT_LLM_MAX_RETRIES),
     toolSelectionStrategy: parseToolStrategy(process.env.AGENT_TOOL_SELECTION_STRATEGY),
     logLevel,
+  }
+}
+
+// Read AGENT_<prefix>_PROVIDER_TYPE / _BASE_URL / _API_KEY / _MODEL into a
+// stage override block. Returns undefined if no field is set so the agent
+// inherits everything from the top-level defaults.
+const parseStageOverride = (prefix: string): IAgentStageOverride | undefined => {
+  const provider = process.env[`${prefix}_PROVIDER_TYPE`]?.trim()
+  const baseURL = process.env[`${prefix}_BASE_URL`]?.trim()
+  const apiKey = process.env[`${prefix}_API_KEY`]?.trim()
+  // Stage block mirrors planner/synthesizer.model. The deprecated single-
+  // string AGENT_PLANNER_MODEL / AGENT_SYNTHESIZER_MODEL still flows through
+  // the legacy plannerModel/synthesizerModel slot - we ignore it here so the
+  // override block can stay independently undefined.
+  if (!provider && !baseURL && !apiKey) {
+    return undefined
+  }
+  if (provider && !PROVIDERS.includes(provider as ProviderType)) {
+    throw new Error(`${prefix}_PROVIDER_TYPE must be ${PROVIDERS.join(' | ')}, got: ${provider}`)
+  }
+  return {
+    providerType: (provider as ProviderType) || undefined,
+    baseURL: baseURL || undefined,
+    apiKey: apiKey || undefined,
   }
 }
 

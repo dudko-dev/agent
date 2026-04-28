@@ -9,6 +9,12 @@ const CONFIG_KEYS = [
   'AGENT_BASE_URL',
   'AGENT_PLANNER_MODEL',
   'AGENT_SYNTHESIZER_MODEL',
+  'AGENT_PLANNER_PROVIDER_TYPE',
+  'AGENT_PLANNER_BASE_URL',
+  'AGENT_PLANNER_API_KEY',
+  'AGENT_SYNTHESIZER_PROVIDER_TYPE',
+  'AGENT_SYNTHESIZER_BASE_URL',
+  'AGENT_SYNTHESIZER_API_KEY',
   'AGENT_CLIENT_NAME',
   'MCP_SERVERS',
   'AGENT_AVAILABLE_TOOLS',
@@ -161,4 +167,30 @@ test('loadConfig rejects an unknown tool selection strategy', () => {
   setMinimalOpenAi()
   process.env.AGENT_TOOL_SELECTION_STRATEGY = 'random'
   assert.throws(() => loadConfig(), /AGENT_TOOL_SELECTION_STRATEGY/)
+})
+
+test('loadConfig leaves planner / synthesizer override blocks undefined when no env vars are set', () => {
+  setMinimalOpenAi()
+  const c = loadConfig()
+  assert.equal(c.planner, undefined)
+  assert.equal(c.synthesizer, undefined)
+})
+
+test('loadConfig builds a planner override block from AGENT_PLANNER_* env vars', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_PLANNER_PROVIDER_TYPE = 'anthropic'
+  process.env.AGENT_PLANNER_API_KEY = 'sk-anthro'
+  const c = loadConfig()
+  assert.deepEqual(c.planner, {
+    providerType: 'anthropic',
+    baseURL: undefined,
+    apiKey: 'sk-anthro',
+  })
+  assert.equal(c.synthesizer, undefined)
+})
+
+test('loadConfig rejects an unknown AGENT_PLANNER_PROVIDER_TYPE', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_PLANNER_PROVIDER_TYPE = 'mystery'
+  assert.throws(() => loadConfig(), /AGENT_PLANNER_PROVIDER_TYPE/)
 })

@@ -35,6 +35,20 @@ export interface IMcpStdioServerConfig {
 // callers passing { url, headers? } typecheck unchanged as IMcpHttpServerConfig.
 export type IMcpServerConfig = IMcpHttpServerConfig | IMcpStdioServerConfig
 
+// Per-stage override for the planner / synthesizer. Each field is optional
+// and inherits from the top-level IAgentConfig defaults when omitted, so the
+// common case (one provider, one key, one model) stays a single block.
+//
+// Cross-provider override caveat: setting `providerType` without `apiKey`
+// throws at createAgent time - inheriting a key across providers is almost
+// always a configuration mistake (different vendors, different keys).
+export interface IAgentStageOverride {
+  providerType?: ProviderType
+  baseURL?: string
+  apiKey?: string
+  model?: string
+}
+
 export interface IAgentConfig {
   clientName: string
   providerType: ProviderType
@@ -43,7 +57,19 @@ export interface IAgentConfig {
   baseURL?: string
   apiKey: string
   model: string
+  // Per-stage overrides. Use these to put planner on a small/cheap model
+  // while running synthesis on a larger one, OR to mix providers entirely
+  // (e.g. Gemini planner, Anthropic synthesizer). Each block is independent;
+  // omit it to inherit every default from the top level.
+  planner?: IAgentStageOverride
+  synthesizer?: IAgentStageOverride
+  // Deprecated single-string shortcuts. Equivalent to
+  // `planner: { model }` / `synthesizer: { model }`. Kept for back-compat
+  // with the pre-stage-override API; prefer the override blocks for new code.
+  // If both are set for the same stage, the block wins.
+  /** @deprecated use `planner: { model }` */
   plannerModel?: string
+  /** @deprecated use `synthesizer: { model }` */
   synthesizerModel?: string
   mcpServers: Record<string, IMcpServerConfig>
   // Native AI-SDK tools registered alongside MCP-discovered tools. Names

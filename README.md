@@ -90,7 +90,9 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 | --- | --- |
 | `providerType` | `'openai' \| 'anthropic' \| 'google' \| 'openai-compatible'` |
 | `baseURL` | Required for `openai-compatible`; optional for the rest. |
-| `model` / `plannerModel` / `synthesizerModel` | The latter two default to `model`. |
+| `model` | Default model for every stage (executor / planner / synthesizer) when no per-stage override is set. |
+| `planner` / `synthesizer` | Optional per-stage override blocks: `{ providerType?, baseURL?, apiKey?, model? }`. Use these to mix providers (e.g. Gemini planner, Anthropic synthesizer). Cross-provider overrides MUST set their own `apiKey`. |
+| `plannerModel` / `synthesizerModel` | **Deprecated** model-only shortcuts. Equivalent to `planner: { model }` / `synthesizer: { model }`. The override block, if present, wins. |
 | `mcpServers` | `Record<name, { url, headers?, getHeaders? } \| { command, args?, env?, cwd? }>` — HTTP/SSE for remote, stdio for locally-spawned servers. |
 | `tools` | Optional `ToolSet` of native AI-SDK tools registered alongside MCP-discovered ones. Names must not collide with MCP-prefixed names (`createAgent` throws on conflict). |
 | `availableTools` / `excludedTools` | Whitelist / blacklist applied to **all** tools (MCP and native). |
