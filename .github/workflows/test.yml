@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # Lets a maintainer re-run the suite from the Actions tab without pushing,
+  # e.g. to verify a flaky test passes against the current main HEAD.
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Format check
+        run: npm run format:check
+
+      # Build before tests so the dist-loadable suite can verify both the
+      # CJS and ESM bundles actually load (it skips itself on a clean tree).
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
