@@ -1,0 +1,46 @@
+# Source — published artifacts live in dist/
+src/
+examples/
+tests/
+test/
+__tests__/
+
+# Configs not needed at install time
+tsconfig*.json
+tsup.config.ts
+.eslintrc*
+.prettierrc*
+.editorconfig
+.nvmrc
+.gitattributes
+
+# Local environment / secrets
+.env
+.env.*
+!env.example
+
+# CI / VCS
+.github/
+.gitignore
+.git/
+.claude/
+.vscode/
+.idea/
+
+# Caches & build intermediates
+node_modules/
+coverage/
+.nyc_output/
+.cache/
+.turbo/
+.parcel-cache/
+*.tsbuildinfo
+
+# Logs & OS junk
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.DS_Store
+Thumbs.db

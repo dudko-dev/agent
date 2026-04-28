@@ -1,0 +1,196 @@
+import { stepCountIs, streamText, type ToolSet } from 'ai'
+import type { IAgentInternalContext } from './internal.ts'
+import { EXECUTOR_SYSTEM, buildExecutorUserPrompt } from './prompts.ts'
+import type { IConversationTurn, IPlan, IPlanStep, IStepResult, IUsage } from './types.ts'
+import { withRetry, withTimeout } from './utils.ts'
+
+export const buildActiveToolSet = (ctx: IAgentInternalContext, step: IPlanStep): ToolSet => {
+  if (ctx.config.toolSelectionStrategy !== 'plan-narrowed') {
+    return ctx.tools
+  }
+  const allowed = new Set(step.suggestedTools ?? [])
+  if (allowed.size === 0) {
+    // Recovery path: planner originally suggested tools but every name was
+    // unknown (see planner.ts). Falling back to the full toolset gives the
+    // executor a chance to succeed instead of stalling with zero tools.
+    if (step.requiresTools) {
+      return ctx.tools
+    }
+    return {}
+  }
+  const filtered: ToolSet = {}
+  for (const name of allowed) {
+    const tool = ctx.tools[name]
+    if (tool) {
+      filtered[name] = tool
+    }
+  }
+  return filtered
+}
+
+const BLOCKER_SENTINEL = '[BLOCKER]'
+
+// Splits the executor's raw reply into a clean summary + a structural blocked
+// flag. The sentinel is removed from the surfaced summary so it does not
+// pollute downstream prompts (planner/replanner/synthesizer); the boolean
+// drives runner.ts's decision to invoke the replanner. Language-agnostic by
+// construction - works regardless of which language the executor wrote in.
+export const splitBlockerSentinel = (raw: string): { summary: string; blocked: boolean } => {
+  const idx = raw.indexOf(BLOCKER_SENTINEL)
+  if (idx === -1) {
+    return { summary: raw, blocked: false }
+  }
+  const cleaned = (raw.slice(0, idx) + raw.slice(idx + BLOCKER_SENTINEL.length)).trim()
+  return { summary: cleaned, blocked: true }
+}
+
+const SUMMARY_MAX_CHARS = 4000
+
+const truncateForTrace = (s: string): string =>
+  s.length > SUMMARY_MAX_CHARS
+    ? `${s.slice(0, SUMMARY_MAX_CHARS)}... [truncated, ${s.length - SUMMARY_MAX_CHARS} chars]`
+    : s
+
+interface RunOnceOutcome {
+  summary: string
+  toolCalls: IStepResult['toolCalls']
+  usage: IUsage
+  blocked: boolean
+}
+
+export const executeStep = async (
+  input: string,
+  plan: IPlan,
+  step: IPlanStep,
+  trace: IStepResult[],
+  history: IConversationTurn[] | undefined,
+  ctx: IAgentInternalContext,
+  signal?: AbortSignal,
+): Promise<IStepResult> => {
+  const startedAt = Date.now()
+
+  const outcome = await withRetry(() => runOnce(input, plan, step, trace, history, ctx, signal), {
+    maxRetries: ctx.config.llmMaxRetries ?? 2,
+    signal,
+    onRetry: (attempt, err) =>
+      ctx.emit({ type: 'retry', phase: 'execute', attempt, error: (err as Error).message }),
+  })
+
+  // Emit usage exactly once per executeStep, with the usage of the *successful*
+  // attempt. Doing this inside withRetry would over-count when retries fire.
+  ctx.emit({ type: 'usage', phase: 'execute', usage: outcome.usage })
+
+  return {
+    step,
+    summary: outcome.summary,
+    toolCalls: outcome.toolCalls,
+    durationMs: Date.now() - startedAt,
+    blocked: outcome.blocked,
+  }
+}
+
+const runOnce = async (
+  input: string,
+  plan: IPlan,
+  step: IPlanStep,
+  trace: IStepResult[],
+  history: IConversationTurn[] | undefined,
+  ctx: IAgentInternalContext,
+  signal?: AbortSignal,
+): Promise<RunOnceOutcome> => {
+  const toolCalls: IStepResult['toolCalls'] = []
+  const toolInputs = new Map<string, { name: string; input: unknown }>()
+
+  const activeTools = buildActiveToolSet(ctx, step)
+  const narrowed = ctx.config.toolSelectionStrategy === 'plan-narrowed'
+
+  const result = streamText({
+    model: ctx.executorModel,
+    tools: activeTools,
+    // Defence-in-depth: explicitly tell the SDK which tools are callable in
+    // this step. Only worth it in narrowed mode; in 'all' mode it's just a
+    // copy of every key, equivalent to omitting the field.
+    ...(narrowed ? { activeTools: Object.keys(activeTools) } : {}),
+    stopWhen: stepCountIs(ctx.config.maxStepsPerTask),
+    system: ctx.config.systemPrompt
+      ? `${EXECUTOR_SYSTEM}\n\nDomain context:\n${ctx.config.systemPrompt}`
+      : EXECUTOR_SYSTEM,
+    prompt: buildExecutorUserPrompt(input, plan, step, trace, history),
+    abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
+  })
+
+  for await (const part of result.fullStream) {
+    switch (part.type) {
+      case 'text-delta':
+        if (part.text) {
+          ctx.emit({ type: 'step.text-delta', step, delta: part.text })
+        }
+        break
+      case 'tool-call': {
+        toolInputs.set(part.toolCallId, { name: part.toolName, input: part.input })
+        ctx.emit({ type: 'step.tool-call', step, name: part.toolName, input: part.input })
+        break
+      }
+      case 'tool-result': {
+        const known = toolInputs.get(part.toolCallId)
+        toolCalls.push({
+          name: part.toolName,
+          input: known?.input ?? part.input,
+          output: part.output,
+          ok: true,
+        })
+        ctx.emit({
+          type: 'step.tool-result',
+          step,
+          name: part.toolName,
+          output: part.output,
+          ok: true,
+        })
+        toolInputs.delete(part.toolCallId)
+        break
+      }
+      case 'tool-error': {
+        const known = toolInputs.get(part.toolCallId)
+        toolCalls.push({
+          name: part.toolName,
+          input: known?.input ?? part.input,
+          output: part.error,
+          ok: false,
+        })
+        ctx.emit({
+          type: 'step.tool-result',
+          step,
+          name: part.toolName,
+          output: part.error,
+          ok: false,
+        })
+        toolInputs.delete(part.toolCallId)
+        break
+      }
+      case 'error': {
+        const error = part.error
+        throw error instanceof Error ? error : new Error(String(error))
+      }
+    }
+  }
+
+  const [text, usage] = await Promise.all([result.text, result.usage])
+  const { summary: cleaned, blocked } = splitBlockerSentinel(text.trim())
+  const summary =
+    cleaned.length > 0
+      ? truncateForTrace(cleaned)
+      : toolCalls.length > 0
+        ? `Executed ${toolCalls.length} tool call(s) without producing a final message; consider raising maxStepsPerTask.`
+        : 'Step produced no output.'
+
+  return {
+    summary,
+    toolCalls,
+    blocked,
+    usage: {
+      inputTokens: usage.inputTokens ?? 0,
+      outputTokens: usage.outputTokens ?? 0,
+      totalTokens: usage.totalTokens ?? 0,
+    },
+  }
+}
