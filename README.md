@@ -2,6 +2,12 @@
 
 A small, opinionated planning agent that uses tools exposed via [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers, built on top of the [Vercel AI SDK](https://sdk.vercel.ai/).
 
+[![npm](https://img.shields.io/npm/v/@dudko.dev/agent.svg)](https://www.npmjs.com/package/@dudko.dev/agent)
+[![npm](https://img.shields.io/npm/dy/@dudko.dev/agent.svg)](https://www.npmjs.com/package/@dudko.dev/agent)
+[![NpmLicense](https://img.shields.io/npm/l/@dudko.dev/agent.svg)](https://www.npmjs.com/package/@dudko.dev/agent)
+![GitHub last commit](https://img.shields.io/github/last-commit/dudko-dev/agent.svg)
+![GitHub release](https://img.shields.io/github/release/dudko-dev/agent.svg)
+
 The agent runs a plan → execute → replan → synthesize loop:
 
 1. **Plan** — the planner LLM produces a structured plan (a thought + ordered steps with optional suggested tools).
@@ -66,6 +72,23 @@ setTimeout(() => ac.abort(), 30_000)
 await agent.run({ input: '...', signal: ac.signal })
 ```
 
+The run-level signal terminates everything. To cancel a single step (e.g. a long tool call) without aborting the whole run, use `onStepStart` — the cancelled step records as `blocked: true` and the replanner runs next:
+
+```ts
+await agent.run({
+  input: '...',
+  onStepStart: ({ step, abort }) => {
+    if (step.suggestedTools?.includes('expensive_tool')) {
+      abort()
+    }
+  },
+})
+```
+
+### OpenTelemetry
+
+The agent emits OTel spans for `agent.run`, `agent.plan`, `agent.execute_step`, `agent.replan`, and `agent.synthesize` via the `@opentelemetry/api` package. With no SDK installed, the calls are no-ops; install your favorite OTel exporter (jaeger, otlp, console) and you get traces and parent-child relationships out of the box. Span attributes are documented in [`src/tracing.ts`](./src/tracing.ts).
+
 ### Conversation history
 
 Pass prior turns as `history` on each run; the agent treats them as context but does not mutate the array.
@@ -108,6 +131,8 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 | `keepSandbox` | When `true`, the per-run directory is not removed after the run completes. Default `false`. |
 | `systemPrompt` | Appended to the planner, executor, replanner, and synthesizer system prompts so the same domain context (persona, language, tone) reaches every stage. |
 | `failOnNoTools` | When `true`, `createAgent` throws if every configured MCP server failed to connect (otherwise the agent starts with zero tools and emits an `error`-level log). Default `false`. |
+| `maxConcurrentRuns` | Hard cap on concurrent `agent.run()` calls. When reached, further calls reject synchronously. Default: unlimited. Intentionally a throw, not a queue — back-pressure belongs on the caller. |
+| `persistence` | Optional `IPersistence` facade. Receives `IRunSnapshot` at run start, after every step, and at run completion. **Write-only by design** — used for audit / observability / debugging. The agent itself never reads back. Resume-after-crash is not yet supported. See [`examples/persistence-sqlite.ts`](./examples/persistence-sqlite.ts). |
 | `logLevel` | `'none' \| 'error' \| 'warn' \| 'info' \| 'debug'` |
 
 ## API

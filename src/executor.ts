@@ -1,6 +1,7 @@
 import { stepCountIs, streamText, type ToolSet } from 'ai'
 import type { IAgentInternalContext } from './internal.ts'
 import { EXECUTOR_SYSTEM, buildExecutorUserPrompt, withDomainContext } from './prompts.ts'
+import { ATTR, withSpan } from './tracing.ts'
 import type { IConversationTurn, IPlan, IPlanStep, IStepResult, IUsage } from './types.ts'
 import { withRetry, withTimeout } from './utils.ts'
 
@@ -66,28 +67,39 @@ export const executeStep = async (
   history: IConversationTurn[] | undefined,
   ctx: IAgentInternalContext,
   signal?: AbortSignal,
-): Promise<IStepResult> => {
-  const startedAt = Date.now()
-
-  const outcome = await withRetry(() => runOnce(input, plan, step, trace, history, ctx, signal), {
-    maxRetries: ctx.config.llmMaxRetries ?? 2,
-    signal,
-    onRetry: (attempt, err) =>
-      ctx.emit({ type: 'retry', phase: 'execute', attempt, error: (err as Error).message }),
-  })
-
-  // Emit usage exactly once per executeStep, with the usage of the *successful*
-  // attempt. Doing this inside withRetry would over-count when retries fire.
-  ctx.emit({ type: 'usage', phase: 'execute', usage: outcome.usage })
-
-  return {
-    step,
-    summary: outcome.summary,
-    toolCalls: outcome.toolCalls,
-    durationMs: Date.now() - startedAt,
-    blocked: outcome.blocked,
-  }
-}
+): Promise<IStepResult> =>
+  withSpan(
+    'agent.execute_step',
+    {
+      [ATTR.PHASE]: 'execute',
+      [ATTR.STEP_ID]: step.id,
+    },
+    async (span) => {
+      const startedAt = Date.now()
+      const outcome = await withRetry(
+        () => runOnce(input, plan, step, trace, history, ctx, signal),
+        {
+          maxRetries: ctx.config.llmMaxRetries ?? 2,
+          signal,
+          onRetry: (attempt, err) =>
+            ctx.emit({ type: 'retry', phase: 'execute', attempt, error: (err as Error).message }),
+        },
+      )
+      // Emit usage exactly once per executeStep, with the usage of the *successful*
+      // attempt. Doing this inside withRetry would over-count when retries fire.
+      ctx.emit({ type: 'usage', phase: 'execute', usage: outcome.usage })
+      span.setAttribute(ATTR.USAGE_TOTAL_TOKENS, outcome.usage.totalTokens)
+      span.setAttribute(ATTR.STEP_BLOCKED, outcome.blocked)
+      span.setAttribute(ATTR.TOOL_COUNT, outcome.toolCalls.length)
+      return {
+        step,
+        summary: outcome.summary,
+        toolCalls: outcome.toolCalls,
+        durationMs: Date.now() - startedAt,
+        blocked: outcome.blocked,
+      }
+    },
+  )
 
 const runOnce = async (
   input: string,

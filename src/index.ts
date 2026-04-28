@@ -25,6 +25,9 @@ export type {
   IMcpHttpServerConfig,
   IMcpServerConfig,
   IMcpStdioServerConfig,
+  IPersistence,
+  IRunSnapshot,
+  IStepStartInfo,
   IPlan,
   IPlanStep,
   IStepResult,
@@ -308,6 +311,15 @@ export const createAgent = async (
       }
       if (refreshing) {
         throw new Error('Agent is refreshing tools; retry shortly')
+      }
+      const cap = config.maxConcurrentRuns
+      if (typeof cap === 'number' && cap > 0 && activeRuns >= cap) {
+        // Synchronous reject: the caller should rate-limit on its side; we
+        // intentionally avoid a queue so close()/reconnect() stay simple
+        // (no pending-promises bookkeeping to drain).
+        throw new Error(
+          `maxConcurrentRuns reached (${activeRuns}/${cap}); rate-limit on the caller side or raise the cap`,
+        )
       }
       activeRuns++
       try {

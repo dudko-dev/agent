@@ -12,10 +12,14 @@ import type {
   AgentEvent,
   IAgentRunOptions,
   IAgentRunResult,
+  IPersistence,
   IPlan,
+  IRunSnapshot,
   IStepResult,
   IUsage,
 } from './types.ts'
+import { ATTR, withSpan } from './tracing.ts'
+import { combineSignals } from './utils.ts'
 
 // Replanner is invoked when:
 //   - the executor explicitly signalled a blocker (via the [BLOCKER] sentinel,
@@ -50,17 +54,32 @@ export const runAgentLoop = async (
   const runId = randomUUID()
   const sandboxDir = resolveSandboxDir(ctx, runId)
   return runContext.run({ runId, startedAt: Date.now(), sandboxDir }, async () => {
-    try {
-      return await runAgentLoopInner(ctx, options)
-    } finally {
-      // Best-effort cleanup. If the run never wrote anything, rm with
-      // force:true is a no-op; if it did, we drop the whole subtree. The
-      // catch is intentional - we'd rather leak a temp dir than throw on
-      // teardown and mask the real run result.
-      if (!ctx.config.keepSandbox) {
-        await rm(sandboxDir, { recursive: true, force: true }).catch(() => {})
-      }
-    }
+    return withSpan(
+      'agent.run',
+      {
+        [ATTR.RUN_ID]: runId,
+        [ATTR.PROVIDER]: ctx.config.providerType,
+        [ATTR.MODEL]: ctx.config.model,
+      },
+      async (span) => {
+        try {
+          const result = await runAgentLoopInner(ctx, options)
+          span.setAttribute(ATTR.ITERATIONS, result.iterations)
+          span.setAttribute(ATTR.USAGE_TOTAL_TOKENS, result.usage.totalTokens)
+          span.setAttribute(ATTR.USAGE_INPUT_TOKENS, result.usage.inputTokens)
+          span.setAttribute(ATTR.USAGE_OUTPUT_TOKENS, result.usage.outputTokens)
+          return result
+        } finally {
+          // Best-effort cleanup. If the run never wrote anything, rm with
+          // force:true is a no-op; if it did, we drop the whole subtree. The
+          // catch is intentional - we'd rather leak a temp dir than throw on
+          // teardown and mask the real run result.
+          if (!ctx.config.keepSandbox) {
+            await rm(sandboxDir, { recursive: true, force: true }).catch(() => {})
+          }
+        }
+      },
+    )
   })
 }
 
@@ -76,6 +95,33 @@ const runAgentLoopInner = async (
   const onEvent = options.onEvent ?? (() => {})
 
   const totalUsage: IUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+  const startedAt = runContext.getStore()?.startedAt ?? Date.now()
+  const runId = runContext.getStore()?.runId ?? '<unknown>'
+
+  // Persistence facade. Hooks may be async; we await so a slow store
+  // back-pressures the run. Failures are logged but never propagate -
+  // persistence is observability, not a correctness boundary.
+  const persistence: IPersistence | undefined = ctx.config.persistence
+  const callPersistence = async (
+    label: 'onRunStart' | 'onStepComplete' | 'onRunComplete',
+    snapshot: IRunSnapshot,
+  ): Promise<void> => {
+    const fn = persistence?.[label]
+    if (!fn) {
+      return
+    }
+    try {
+      await fn(snapshot)
+    } catch (err) {
+      ctx.emit({
+        type: 'log',
+        level: 'warn',
+        message: `[persistence] ${label} threw: ${(err as Error).message}`,
+        // tagging by emit() proxy below handles runId; but we're called
+        // from within the run, so getStore is set.
+      })
+    }
+  }
 
   const proxiedCtx: IAgentInternalContext = {
     ...ctx,
@@ -101,6 +147,17 @@ const runAgentLoopInner = async (
   } catch (err) {
     proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'plan' })
     if (isAbortError(err) || signal?.aborted) {
+      await callPersistence('onRunComplete', {
+        runId,
+        startedAt,
+        status: 'cancelled',
+        input,
+        history,
+        trace: [],
+        usage: totalUsage,
+        error: (err as Error).message,
+        completedAt: Date.now(),
+      })
       throw err
     }
     // Graceful degradation only for non-abort failures (e.g. schema validation
@@ -127,6 +184,17 @@ const runAgentLoopInner = async (
   const maxRevisions = ctx.config.maxRevisions ?? 2
   const tokenCap = ctx.config.maxTotalTokens
 
+  await callPersistence('onRunStart', {
+    runId,
+    startedAt,
+    status: 'executing',
+    input,
+    history,
+    plan: currentPlan,
+    trace,
+    usage: totalUsage,
+  })
+
   while (iterations < ctx.config.maxIterations) {
     iterations++
     if (signal?.aborted) {
@@ -143,15 +211,89 @@ const runAgentLoopInner = async (
     const step = currentPlan.steps[stepIndex]
     proxiedCtx.emit({ type: 'step.start', step, index: stepIndex })
 
+    // Per-step abort: separate from the run-level signal so the user can
+    // cancel just the current step (records as blocked, replanner runs)
+    // without aborting the whole run.
+    const stepAC = new AbortController()
+    if (options.onStepStart) {
+      try {
+        options.onStepStart({ step, index: stepIndex, abort: () => stepAC.abort() })
+      } catch (err) {
+        // Don't let a buggy callback crash the run; emit a log warn so the
+        // surface is observable.
+        proxiedCtx.emit({
+          type: 'log',
+          level: 'warn',
+          message: `[step] onStepStart callback threw: ${(err as Error).message}`,
+        })
+      }
+    }
+    const stepSignal = combineSignals([signal, stepAC.signal])
+
     let result: IStepResult
     try {
-      result = await executeStep(input, currentPlan, step, trace, history, proxiedCtx, signal)
+      result = await executeStep(input, currentPlan, step, trace, history, proxiedCtx, stepSignal)
     } catch (err) {
-      proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'execute' })
-      throw err
+      // Distinguish run-level abort (propagate) from step-level abort
+      // (treat as blocker so the replanner gets a chance to recover).
+      if (signal?.aborted) {
+        proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'execute' })
+        await callPersistence('onRunComplete', {
+          runId,
+          startedAt,
+          status: 'cancelled',
+          input,
+          history,
+          plan: currentPlan,
+          trace,
+          usage: totalUsage,
+          error: (err as Error).message,
+          completedAt: Date.now(),
+        })
+        throw err
+      }
+      if (stepAC.signal.aborted && isAbortError(err)) {
+        proxiedCtx.emit({
+          type: 'log',
+          level: 'info',
+          message: `[step] aborted via onStepStart callback; replanner will decide what to do`,
+        })
+        result = {
+          step,
+          summary: '[step aborted by caller]',
+          toolCalls: [],
+          durationMs: 0,
+          blocked: true,
+        }
+      } else {
+        proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'execute' })
+        await callPersistence('onRunComplete', {
+          runId,
+          startedAt,
+          status: 'failed',
+          input,
+          history,
+          plan: currentPlan,
+          trace,
+          usage: totalUsage,
+          error: (err as Error).message,
+          completedAt: Date.now(),
+        })
+        throw err
+      }
     }
     trace.push(result)
     proxiedCtx.emit({ type: 'step.complete', step, result })
+    await callPersistence('onStepComplete', {
+      runId,
+      startedAt,
+      status: 'executing',
+      input,
+      history,
+      plan: currentPlan,
+      trace,
+      usage: totalUsage,
+    })
 
     const nextStep = currentPlan.steps[stepIndex + 1] ?? null
     const isLastPlannedStep = nextStep === null
@@ -182,6 +324,18 @@ const runAgentLoopInner = async (
       decision = await decideNextAction(input, currentPlan, trace, nextStep, proxiedCtx, signal)
     } catch (err) {
       proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'replan' })
+      await callPersistence('onRunComplete', {
+        runId,
+        startedAt,
+        status: isAbortError(err) || signal?.aborted ? 'cancelled' : 'failed',
+        input,
+        history,
+        plan: currentPlan,
+        trace,
+        usage: totalUsage,
+        error: (err as Error).message,
+        completedAt: Date.now(),
+      })
       throw err
     }
     proxiedCtx.emit({
@@ -213,9 +367,33 @@ const runAgentLoopInner = async (
     text = await synthesizeAnswer(input, currentPlan, trace, history, proxiedCtx, signal)
   } catch (err) {
     proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'synthesize' })
+    await callPersistence('onRunComplete', {
+      runId,
+      startedAt,
+      status: isAbortError(err) || signal?.aborted ? 'cancelled' : 'failed',
+      input,
+      history,
+      plan: currentPlan,
+      trace,
+      usage: totalUsage,
+      error: (err as Error).message,
+      completedAt: Date.now(),
+    })
     throw err
   }
   proxiedCtx.emit({ type: 'final', text })
+  await callPersistence('onRunComplete', {
+    runId,
+    startedAt,
+    status: 'complete',
+    input,
+    history,
+    plan: currentPlan,
+    trace,
+    usage: totalUsage,
+    text,
+    completedAt: Date.now(),
+  })
 
   return { text, plan: currentPlan, trace, iterations, usage: totalUsage }
 }

@@ -22,6 +22,13 @@ const main = async (): Promise<void> => {
       process.exit(2)
     }
   }
+  // Apply --flag overrides AFTER --env-file so flags always win, even when an
+  // env-file already set the same key. Mutating process.env is local to this
+  // CLI process; it never leaks out via inheritance because Node only forks
+  // child env from this point onward (we don't spawn anything user-visible).
+  for (const [k, v] of Object.entries(args.overrides)) {
+    process.env[k] = v
+  }
   try {
     await runRepl()
   } catch (err) {

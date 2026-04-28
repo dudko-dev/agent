@@ -91,6 +91,16 @@ export interface IAgentConfig {
   maxTotalTokens?: number
   llmTimeoutMs?: number
   llmMaxRetries?: number
+  // Hard cap on the number of concurrent agent.run() calls a single agent
+  // instance will accept. When the cap is reached, further run() calls reject
+  // synchronously with a ConcurrencyLimitError. Default: unlimited. The cap
+  // is intentionally a throw rather than a queue - applications that need
+  // back-pressure should run a queue on their side.
+  maxConcurrentRuns?: number
+  // Optional facade for durable run snapshots. The agent itself never reads
+  // the data back; implementations can persist for audit, debugging, or
+  // resume-after-crash workflows.
+  persistence?: IPersistence
   toolSelectionStrategy?: ToolSelectionStrategy
   // Sanitize an input the LLM passed to a tool BEFORE the call is dispatched
   // and BEFORE the step.tool-call event is emitted. Use to redact secrets the
@@ -166,6 +176,11 @@ export type ReplanCause = 'last-step' | 'clean-step' | 'llm-decision'
 
 type AgentEventBody =
   | { type: 'plan.thought-delta'; delta: string }
+  // Fires once per planner step as soon as the structured-output stream has
+  // emitted enough fields for the step to be coherent (description present).
+  // The step may still be revised before plan.created lands - prefer this
+  // event for incremental UI hints, and plan.created for the canonical plan.
+  | { type: 'plan.step-added'; step: IPlanStep; index: number }
   | { type: 'plan.created'; plan: IPlan }
   | { type: 'plan.revised'; plan: IPlan; reason: string }
   | { type: 'step.start'; step: IPlanStep; index: number }
@@ -199,11 +214,23 @@ export type AgentEvent = AgentEventBody & { runId?: string }
 
 export type EventHandler = (event: AgentEvent) => void
 
+// Synchronous callback fired right before each plan step starts executing.
+// The caller can call `abort()` to cancel JUST that step (the rest of the
+// run continues - the cancelled step records as blocked, the replanner is
+// invoked next). This is distinct from the run-level AbortSignal, which
+// terminates the whole run.
+export interface IStepStartInfo {
+  step: IPlanStep
+  index: number
+  abort: () => void
+}
+
 export interface IAgentRunOptions {
   input: string
   history?: IConversationTurn[]
   signal?: AbortSignal
   onEvent?: EventHandler
+  onStepStart?: (info: IStepStartInfo) => void
 }
 
 export interface IAgentRunResult {
@@ -212,4 +239,34 @@ export interface IAgentRunResult {
   trace: IStepResult[]
   iterations: number
   usage: IUsage
+}
+
+// Snapshot of a run handed to IPersistence hooks. Each hook receives the
+// fields most relevant at its lifecycle point; consumers should treat these
+// as read-only.
+export interface IRunSnapshot {
+  runId: string
+  startedAt: number
+  status: 'planning' | 'executing' | 'complete' | 'failed' | 'cancelled'
+  input: string
+  history?: IConversationTurn[]
+  plan?: IPlan
+  trace: IStepResult[]
+  usage: IUsage
+  text?: string
+  error?: string
+  completedAt?: number
+}
+
+// Optional persistence facade. Hooks fire at run start, after each step, and
+// at run completion. Implementations decide what (if anything) to durably
+// store - the agent itself never reads the data back.
+//
+// All hooks may be async; the agent awaits them so a slow store back-pressures
+// the run. Throws are caught and logged at warn level - persistence failures
+// must NEVER crash a run.
+export interface IPersistence {
+  onRunStart?: (snapshot: IRunSnapshot) => void | Promise<void>
+  onStepComplete?: (snapshot: IRunSnapshot) => void | Promise<void>
+  onRunComplete?: (snapshot: IRunSnapshot) => void | Promise<void>
 }

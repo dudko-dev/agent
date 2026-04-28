@@ -31,3 +31,27 @@ test('rejects unknown flags in strict mode', () => {
 test('rejects positional args', () => {
   assert.throws(() => parseCliArgs(['some-positional']))
 })
+
+test('parses CLI overrides into env-var name keys', () => {
+  const args = parseCliArgs([
+    '--provider=anthropic',
+    '--model=claude-4-sonnet',
+    '--planner-model=claude-4-haiku',
+    '--log-level=debug',
+    '--max-iterations=5',
+    '--tool-strategy=plan-narrowed',
+  ])
+  assert.deepEqual(args.overrides, {
+    AGENT_PROVIDER_TYPE: 'anthropic',
+    AGENT_MODEL: 'claude-4-sonnet',
+    AGENT_PLANNER_MODEL: 'claude-4-haiku',
+    AGENT_LOG_LEVEL: 'debug',
+    AGENT_MAX_ITERATIONS: '5',
+    AGENT_TOOL_SELECTION_STRATEGY: 'plan-narrowed',
+  })
+})
+
+test('overrides is empty when no CLI flags are passed', () => {
+  const args = parseCliArgs([])
+  assert.deepEqual(args.overrides, {})
+})
