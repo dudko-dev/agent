@@ -1,6 +1,6 @@
 # @dudko.dev/agent
 
-A small, opinionated planning agent that uses tools exposed via [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers, built on top of the [Vercel AI SDK](https://sdk.vercel.ai/).
+This lightweight, opinionated planning agent automates complex workflows by orchestrating tools through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). Built on the [Vercel AI SDK](https://sdk.vercel.ai/) and TypeScript, it offers a truly platform-agnostic solution that integrates into any environment. Its modular architecture allows you to mix and match LLM providers for planning, execution, and synthesis—optimizing for both performance and cost while turning sophisticated AI orchestration into a streamlined, production-ready process. ESM and CJS builds, a REPL CLI, OpenTelemetry instrumentation, and built-in support for persistence and resume make it a versatile choice for developers looking to harness the full potential of LLM-driven agents.
 
 [![npm](https://img.shields.io/npm/v/@dudko.dev/agent.svg)](https://www.npmjs.com/package/@dudko.dev/agent)
 [![npm](https://img.shields.io/npm/dy/@dudko.dev/agent.svg)](https://www.npmjs.com/package/@dudko.dev/agent)
