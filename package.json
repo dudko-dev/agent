@@ -1,6 +1,6 @@
 {
   "name": "@dudko.dev/agent",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "type": "module",
   "description": "Tool-using planning agent over MCP servers, built on the Vercel AI SDK.",
   "keywords": [

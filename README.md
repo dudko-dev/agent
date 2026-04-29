@@ -167,6 +167,28 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 | `persistence` | Optional `IPersistence` facade. Receives `IRunSnapshot` at run start, at every iteration boundary, and at run completion. Implementing the optional `loadRun(runId)` enables resume via `agent.run({ resumeFromRunId })`. See [`examples/persistence-sqlite.ts`](./examples/persistence-sqlite.ts) for a `node:sqlite`-backed adapter. |
 | `logLevel` | `'none' \| 'error' \| 'warn' \| 'info' \| 'debug'` |
 
+### Picking models per stage
+
+Match each stage to the **thinking level** the role needs, not to a specific model name (vendors rename and re-tier often). When in doubt, set `model` once and let every stage inherit it — split per stage only when cost or quality becomes a real constraint.
+
+| Stage | Thinking level | Why |
+| --- | --- | --- |
+| Planner / Replanner | **high** | Decomposes the task and decides when to stop or revise. A bad plan burns the whole iteration budget. |
+| Synthesizer | **medium**–**high** | Reads the full trace and writes the user-visible answer. |
+| Executor | **low**–**medium** | Runs one step at a time, mostly tool calls. Invoked many times per run — the natural place to optimize cost and latency, as long as tool-call reliability holds. |
+
+Rough family mapping at the time of writing (verify against current vendor docs — examples, not recommendations):
+
+- **High** — e.g. Anthropic Opus, Gemini Pro with thinking enabled.
+- **Medium** — e.g. Anthropic Sonnet, OpenAI GPT-4.1.
+- **Low** — e.g. Anthropic Haiku, Gemini Flash.
+
+Notes:
+
+- Replanner has no separate override — it always shares the planner's model and provider.
+- A too-weak executor with flaky tool-call JSON collapses the whole loop. The **low** tier only works for models specifically tuned for tool use.
+- The executor runs once per plan step (× multi-step tool calling inside each step), so it dominates per-run cost. Optimize there first.
+
 ## API
 
 ```ts
