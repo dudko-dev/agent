@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { zodSchema } from '@ai-sdk/provider-utils'
+import type { z } from 'zod'
 import { PlanSchema } from '../src/planner.ts'
 import { DecisionSchema } from '../src/replanner.ts'
 
@@ -18,10 +19,12 @@ const collect = (node: unknown, path: string, hits: string[]): void => {
   }
 }
 
-for (const [name, schema] of [
+const cases: ReadonlyArray<readonly [string, z.ZodType]> = [
   ['PlanSchema', PlanSchema],
   ['DecisionSchema (replanner)', DecisionSchema],
-] as const) {
+]
+
+for (const [name, schema] of cases) {
   test(`${name}: produces no forbidden Anthropic-incompatible JSON Schema keywords`, () => {
     const js = zodSchema(schema).jsonSchema
     const hits: string[] = []
