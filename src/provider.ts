@@ -279,11 +279,9 @@ export const buildModelFromStage = async (
       // The two valid call shapes are { binding } | { accountId, apiKey }
       // (with optional `gateway`). We assemble whichever the caller asked
       // for and let TS verify the union at the call site.
-      const opts = ('binding' in rest
-        ? rest
-        : { accountId: accountId!, apiKey: stage.apiKey, ...rest }) as Parameters<
-        typeof createWorkersAI
-      >[0]
+      const opts = (
+        'binding' in rest ? rest : { accountId: accountId!, apiKey: stage.apiKey, ...rest }
+      ) as Parameters<typeof createWorkersAI>[0]
       const provider = createWorkersAI(opts)
       return provider(stage.model as Parameters<typeof provider>[0])
     }
