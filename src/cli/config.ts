@@ -6,7 +6,23 @@ import type {
   ProviderType,
 } from '../index.ts'
 
-const PROVIDERS: readonly ProviderType[] = ['openai', 'anthropic', 'openai-compatible', 'google']
+const PROVIDERS: readonly ProviderType[] = [
+  'openai',
+  'anthropic',
+  'openai-compatible',
+  'google',
+  'xai',
+  'azure',
+  'amazon-bedrock',
+  'google-vertex',
+  'deepseek',
+  'gateway',
+  'cloudflare',
+]
+const REQUIRES_BASE_URL: ReadonlySet<ProviderType> = new Set<ProviderType>([
+  'openai-compatible',
+  'azure',
+])
 const LOG_LEVELS: readonly LogLevel[] = ['none', 'error', 'warn', 'info', 'debug']
 const TOOL_STRATEGIES = ['all', 'plan-narrowed'] as const
 type ToolStrategy = (typeof TOOL_STRATEGIES)[number]
@@ -22,13 +38,12 @@ export const loadConfig = (): IAgentConfig => {
     throw new Error(`AGENT_LOG_LEVEL must be ${LOG_LEVELS.join(' | ')}, got: ${logLevel}`)
   }
 
-  // baseURL is required only for self-hosted OpenAI-compatible servers; for
-  // providers with a known default endpoint (openai, anthropic, google) we
-  // accept an empty/missing value and the SDK uses its built-in default.
-  const baseURL =
-    providerType === 'openai-compatible'
-      ? required('AGENT_BASE_URL')
-      : process.env.AGENT_BASE_URL?.trim() || undefined
+  // baseURL is required for providers with no SDK-default endpoint
+  // (openai-compatible self-hosts, azure deployments). All others accept
+  // an empty/missing value and fall back to the SDK's built-in default.
+  const baseURL = REQUIRES_BASE_URL.has(providerType)
+    ? required('AGENT_BASE_URL')
+    : process.env.AGENT_BASE_URL?.trim() || undefined
 
   return {
     clientName: process.env.AGENT_CLIENT_NAME ?? 'vercel-mcp-test',
@@ -36,6 +51,7 @@ export const loadConfig = (): IAgentConfig => {
     baseURL,
     apiKey: required('AGENT_API_KEY'),
     model: required('AGENT_MODEL'),
+    providerOptions: parseProviderOptions('AGENT_PROVIDER_OPTIONS'),
     // Per-stage overrides: AGENT_PLANNER_* / AGENT_SYNTHESIZER_*. The legacy
     // AGENT_PLANNER_MODEL / AGENT_SYNTHESIZER_MODEL still feed the deprecated
     // top-level model shortcut so existing setups keep working untouched.
@@ -64,11 +80,12 @@ const parseStageOverride = (prefix: string): IAgentStageOverride | undefined => 
   const provider = process.env[`${prefix}_PROVIDER_TYPE`]?.trim()
   const baseURL = process.env[`${prefix}_BASE_URL`]?.trim()
   const apiKey = process.env[`${prefix}_API_KEY`]?.trim()
+  const providerOptions = parseProviderOptions(`${prefix}_PROVIDER_OPTIONS`)
   // Stage block mirrors planner/synthesizer.model. The deprecated single-
   // string AGENT_PLANNER_MODEL / AGENT_SYNTHESIZER_MODEL still flows through
   // the legacy plannerModel/synthesizerModel slot - we ignore it here so the
   // override block can stay independently undefined.
-  if (!provider && !baseURL && !apiKey) {
+  if (!provider && !baseURL && !apiKey && !providerOptions) {
     return undefined
   }
   if (provider && !PROVIDERS.includes(provider as ProviderType)) {
@@ -78,7 +95,28 @@ const parseStageOverride = (prefix: string): IAgentStageOverride | undefined => 
     providerType: (provider as ProviderType) || undefined,
     baseURL: baseURL || undefined,
     apiKey: apiKey || undefined,
+    providerOptions,
   }
+}
+
+// Parse a provider-options JSON env block (e.g. AGENT_PROVIDER_OPTIONS,
+// AGENT_PLANNER_PROVIDER_OPTIONS). Empty / unset returns undefined so the
+// agent's config-level inheritance kicks in.
+const parseProviderOptions = (varName: string): Record<string, unknown> | undefined => {
+  const raw = process.env[varName]?.trim()
+  if (!raw) {
+    return undefined
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (err) {
+    throw new Error(`${varName} must be valid JSON: ${(err as Error).message}`)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${varName} must be a JSON object (got ${typeof parsed})`)
+  }
+  return parsed as Record<string, unknown>
 }
 
 const parseToolStrategy = (raw: string | undefined): ToolStrategy | undefined => {

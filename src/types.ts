@@ -1,6 +1,17 @@
 import type { ToolSet } from 'ai'
 
-export type ProviderType = 'openai' | 'anthropic' | 'openai-compatible' | 'google'
+export type ProviderType =
+  | 'openai'
+  | 'anthropic'
+  | 'openai-compatible'
+  | 'google'
+  | 'xai'
+  | 'azure'
+  | 'amazon-bedrock'
+  | 'google-vertex'
+  | 'deepseek'
+  | 'gateway'
+  | 'cloudflare'
 
 export type LogLevel = 'none' | 'error' | 'warn' | 'info' | 'debug'
 
@@ -47,16 +58,30 @@ export interface IAgentStageOverride {
   baseURL?: string
   apiKey?: string
   model?: string
+  // Escape hatch for provider-specific factory options that don't fit the
+  // baseURL/apiKey shape: Azure `apiVersion` / `resourceName`, Bedrock
+  // `region` / `accessKeyId` / `secretAccessKey`, Vertex `project` /
+  // `location` / `googleAuthOptions`, Cloudflare `accountId`, and so on.
+  // The map is spread into the SDK's create* call AFTER baseURL/apiKey, so
+  // callers can also override those when needed. Inherits from the top-level
+  // config.providerOptions when omitted.
+  providerOptions?: Record<string, unknown>
 }
 
 export interface IAgentConfig {
   clientName: string
   providerType: ProviderType
-  // Optional for providers with a default endpoint (openai, anthropic, google).
-  // Required for openai-compatible (where you point at a self-hosted server).
+  // Optional for providers with a default endpoint (openai, anthropic, google,
+  // xai, deepseek, gateway, amazon-bedrock, google-vertex, cloudflare).
+  // Required for `openai-compatible` (point at a self-hosted server) and
+  // `azure` (point at the Azure OpenAI deployment URL).
   baseURL?: string
   apiKey: string
   model: string
+  // Provider-specific extras forwarded to the SDK factory. See
+  // IAgentStageOverride.providerOptions for details. Each per-stage override
+  // can supply its own block; when absent, this top-level value is used.
+  providerOptions?: Record<string, unknown>
   // Per-stage overrides. Use these to put planner on a small/cheap model
   // while running synthesis on a larger one, OR to mix providers entirely
   // (e.g. Gemini planner, Anthropic synthesizer). Each block is independent;

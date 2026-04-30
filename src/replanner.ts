@@ -7,7 +7,7 @@ import { ATTR, withSpan } from './tracing.ts'
 import type { IPlan, IPlanStep, IStepResult, IUsage } from './types.ts'
 import { withRetry, withTimeout } from './utils.ts'
 
-const DecisionSchema = z.discriminatedUnion('mode', [
+export const DecisionSchema = z.discriminatedUnion('mode', [
   z.object({
     mode: z.literal('continue'),
     reason: z.string().min(1).describe('Why the next step is still appropriate'),

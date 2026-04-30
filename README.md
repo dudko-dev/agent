@@ -15,7 +15,7 @@ The agent runs a plan → execute → replan → synthesize loop:
 3. **Replan** — after each step the replanner decides whether to continue, revise the plan, or finish.
 4. **Synthesize** — once finished, the synthesizer LLM writes the final answer for the user.
 
-Multi-provider out of the box: OpenAI, Anthropic, Google, and any OpenAI-compatible endpoint. Streaming events, per-run cancellation via `AbortSignal`, token budgets, retry/timeout, and concurrent runs on a single agent instance.
+Multi-provider out of the box: OpenAI, Anthropic, Google (Gemini), xAI (Grok), Azure OpenAI, Amazon Bedrock, Google Vertex, DeepSeek, Vercel AI Gateway, Cloudflare Workers AI, and any OpenAI-compatible endpoint. Streaming events, per-run cancellation via `AbortSignal`, token budgets, retry/timeout, and concurrent runs on a single agent instance.
 
 ## Install
 
@@ -24,6 +24,25 @@ npm install @dudko.dev/agent
 ```
 
 Requires Node.js **22.6+**.
+
+Provider SDKs are **optional peer dependencies** — install only the one(s) you actually use:
+
+```bash
+# pick one (or more) per project
+npm install @ai-sdk/openai
+npm install @ai-sdk/anthropic
+npm install @ai-sdk/google
+npm install @ai-sdk/openai-compatible
+npm install @ai-sdk/xai
+npm install @ai-sdk/azure
+npm install @ai-sdk/amazon-bedrock
+npm install @ai-sdk/google-vertex
+npm install @ai-sdk/deepseek
+npm install workers-ai-provider          # cloudflare
+# gateway: no extra install — ships inside `ai`
+```
+
+Setting `providerType` to a value whose SDK isn't installed throws a clear `"Provider package "@ai-sdk/X" is not installed"` error at `createAgent` time.
 
 ## Quick start
 
@@ -142,8 +161,10 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 
 | Field | Notes |
 | --- | --- |
-| `providerType` | `'openai' \| 'anthropic' \| 'google' \| 'openai-compatible'` |
-| `baseURL` | Required for `openai-compatible`; optional for the rest. |
+| `providerType` | `'openai' \| 'anthropic' \| 'google' \| 'openai-compatible' \| 'xai' \| 'azure' \| 'amazon-bedrock' \| 'google-vertex' \| 'deepseek' \| 'gateway' \| 'cloudflare'`. Each provider's SDK is an **optional peerDependency** — install only the package(s) you intend to use; setting `providerType` to a missing one throws at `createAgent` time. |
+| `baseURL` | Required for `openai-compatible` (point at your self-hosted server) and `azure` (point at your deployment URL). Optional for the rest. |
+| `apiKey` | Required by the type, but **ignored** for `google-vertex` (which authenticates via Google ADC). |
+| `providerOptions` | Escape hatch for provider-specific factory options. Spread into the SDK's `create*()` call after `baseURL` / `apiKey`, so anything documented for the underlying SDK works: e.g. `{ apiVersion, resourceName }` for Azure, `{ region, accessKeyId, secretAccessKey }` for Bedrock, `{ project, location, googleAuthOptions }` for Vertex, `{ accountId }` (or `{ binding }` inside a Worker) for Cloudflare. Per-stage override blocks have their own `providerOptions`; if absent, the top-level value is used. |
 | `model` | Default model for every stage (executor / planner / synthesizer) when no per-stage override is set. |
 | `planner` / `synthesizer` | Optional per-stage override blocks: `{ providerType?, baseURL?, apiKey?, model? }`. Use these to mix providers (e.g. Gemini planner, Anthropic synthesizer). Cross-provider overrides MUST set their own `apiKey`. |
 | `plannerModel` / `synthesizerModel` | **Deprecated** model-only shortcuts. Equivalent to `planner: { model }` / `synthesizer: { model }`. The override block, if present, wins. |

@@ -15,11 +15,22 @@ const baseConfig = (overrides: Partial<IAgentConfig> = {}): IAgentConfig => ({
   ...overrides,
 })
 
-const PROVIDERS: ProviderType[] = ['openai', 'anthropic', 'google']
+// Providers exercised via the dynamic-import path. We pick ones whose SDKs
+// construct a model from { apiKey, model } alone (no extra required field
+// like resourceName / accountId), so the test stays self-contained.
+const PROVIDERS: ProviderType[] = [
+  'openai',
+  'anthropic',
+  'google',
+  'xai',
+  'amazon-bedrock',
+  'deepseek',
+  'gateway',
+]
 
 for (const providerType of PROVIDERS) {
-  test(`buildModelFromStage returns a model object for provider=${providerType}`, () => {
-    const model = buildModelFromStage('test', {
+  test(`buildModelFromStage returns a model object for provider=${providerType}`, async () => {
+    const model = await buildModelFromStage('test', {
       providerType,
       apiKey: 'k',
       model: 'some-model',
@@ -28,22 +39,114 @@ for (const providerType of PROVIDERS) {
   })
 }
 
-test('buildModelFromStage for openai-compatible requires baseURL', () => {
-  assert.throws(
+test('buildModelFromStage for google-vertex builds with project + location env vars', async () => {
+  // Vertex resolves project / location lazily from env; set them so the
+  // factory can synthesize a baseURL without contacting Google ADC.
+  const envBackup = {
+    project: process.env.GOOGLE_VERTEX_PROJECT,
+    location: process.env.GOOGLE_VERTEX_LOCATION,
+  }
+  process.env.GOOGLE_VERTEX_PROJECT = 'test-project'
+  process.env.GOOGLE_VERTEX_LOCATION = 'us-central1'
+  try {
+    const model = await buildModelFromStage('test', {
+      providerType: 'google-vertex',
+      apiKey: 'k',
+      model: 'gemini-2.0-flash',
+    })
+    assert.ok(model)
+  } finally {
+    if (envBackup.project === undefined) {
+      delete process.env.GOOGLE_VERTEX_PROJECT
+    } else {
+      process.env.GOOGLE_VERTEX_PROJECT = envBackup.project
+    }
+    if (envBackup.location === undefined) {
+      delete process.env.GOOGLE_VERTEX_LOCATION
+    } else {
+      process.env.GOOGLE_VERTEX_LOCATION = envBackup.location
+    }
+  }
+})
+
+test('buildModelFromStage for openai-compatible requires baseURL', async () => {
+  await assert.rejects(
     () =>
       buildModelFromStage('test', { providerType: 'openai-compatible', apiKey: 'k', model: 'm' }),
     /openai-compatible.*baseURL/,
   )
 })
 
-test('buildModelFromStage for openai-compatible accepts a baseURL', () => {
-  const model = buildModelFromStage('test', {
+test('buildModelFromStage for openai-compatible accepts a baseURL', async () => {
+  const model = await buildModelFromStage('test', {
     providerType: 'openai-compatible',
     apiKey: 'k',
     baseURL: 'https://x.example/v1',
     model: 'm',
   })
   assert.ok(model)
+})
+
+test('buildModelFromStage for azure accepts a baseURL', async () => {
+  const model = await buildModelFromStage('test', {
+    providerType: 'azure',
+    apiKey: 'k',
+    baseURL: 'https://x.openai.azure.com',
+    model: 'm',
+  })
+  assert.ok(model)
+})
+
+test('buildModelFromStage for cloudflare requires accountId from providerOptions or env', async () => {
+  const prev = process.env.CLOUDFLARE_ACCOUNT_ID
+  delete process.env.CLOUDFLARE_ACCOUNT_ID
+  try {
+    await assert.rejects(
+      () => buildModelFromStage('test', { providerType: 'cloudflare', apiKey: 'k', model: 'm' }),
+      /accountId/,
+    )
+  } finally {
+    if (prev !== undefined) {
+      process.env.CLOUDFLARE_ACCOUNT_ID = prev
+    }
+  }
+})
+
+test('buildModelFromStage for cloudflare uses CLOUDFLARE_ACCOUNT_ID env fallback', async () => {
+  const prev = process.env.CLOUDFLARE_ACCOUNT_ID
+  process.env.CLOUDFLARE_ACCOUNT_ID = 'acc-env'
+  try {
+    const model = await buildModelFromStage('test', {
+      providerType: 'cloudflare',
+      apiKey: 'k',
+      model: '@cf/meta/llama-3.1-8b-instruct',
+    })
+    assert.ok(model)
+  } finally {
+    if (prev === undefined) {
+      delete process.env.CLOUDFLARE_ACCOUNT_ID
+    } else {
+      process.env.CLOUDFLARE_ACCOUNT_ID = prev
+    }
+  }
+})
+
+test('buildModelFromStage for cloudflare prefers providerOptions.accountId over env', async () => {
+  const prev = process.env.CLOUDFLARE_ACCOUNT_ID
+  delete process.env.CLOUDFLARE_ACCOUNT_ID
+  try {
+    const model = await buildModelFromStage('test', {
+      providerType: 'cloudflare',
+      apiKey: 'k',
+      model: '@cf/meta/llama-3.1-8b-instruct',
+      providerOptions: { accountId: 'acc-from-options' },
+    })
+    assert.ok(model)
+  } finally {
+    if (prev !== undefined) {
+      process.env.CLOUDFLARE_ACCOUNT_ID = prev
+    }
+  }
 })
 
 test('resolveStage falls through to top-level defaults when no override is given', () => {
@@ -54,7 +157,26 @@ test('resolveStage falls through to top-level defaults when no override is given
     baseURL: 'https://api.example',
     apiKey: 'sk-test',
     model: 'm',
+    providerOptions: {},
   })
+})
+
+test('resolveStage inherits providerOptions from the top-level config', () => {
+  const c = baseConfig({ providerOptions: { region: 'us-east-1' } })
+  const r = resolveStage(c, undefined, undefined, 'executor')
+  assert.deepEqual(r.providerOptions, { region: 'us-east-1' })
+})
+
+test('resolveStage replaces providerOptions when the override block defines its own', () => {
+  const c = baseConfig({ providerOptions: { region: 'us-east-1' } })
+  const r = resolveStage(
+    c,
+    { providerOptions: { region: 'eu-west-1', maxRetries: 3 } },
+    undefined,
+    'planner',
+  )
+  // We REPLACE rather than merge - matches how baseURL/apiKey work.
+  assert.deepEqual(r.providerOptions, { region: 'eu-west-1', maxRetries: 3 })
 })
 
 test('resolveStage applies override fields field-by-field', () => {

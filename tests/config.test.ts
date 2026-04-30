@@ -27,6 +27,9 @@ const CONFIG_KEYS = [
   'AGENT_LLM_MAX_RETRIES',
   'AGENT_TOOL_SELECTION_STRATEGY',
   'AGENT_LOG_LEVEL',
+  'AGENT_PROVIDER_OPTIONS',
+  'AGENT_PLANNER_PROVIDER_OPTIONS',
+  'AGENT_SYNTHESIZER_PROVIDER_OPTIONS',
 ] as const
 
 beforeEach(() => {
@@ -185,6 +188,7 @@ test('loadConfig builds a planner override block from AGENT_PLANNER_* env vars',
     providerType: 'anthropic',
     baseURL: undefined,
     apiKey: 'sk-anthro',
+    providerOptions: undefined,
   })
   assert.equal(c.synthesizer, undefined)
 })
@@ -193,4 +197,35 @@ test('loadConfig rejects an unknown AGENT_PLANNER_PROVIDER_TYPE', () => {
   setMinimalOpenAi()
   process.env.AGENT_PLANNER_PROVIDER_TYPE = 'mystery'
   assert.throws(() => loadConfig(), /AGENT_PLANNER_PROVIDER_TYPE/)
+})
+
+test('loadConfig parses AGENT_PROVIDER_OPTIONS as JSON object', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_PROVIDER_OPTIONS = '{"region":"us-east-1","timeout":5000}'
+  const c = loadConfig()
+  assert.deepEqual(c.providerOptions, { region: 'us-east-1', timeout: 5000 })
+})
+
+test('loadConfig rejects malformed AGENT_PROVIDER_OPTIONS JSON', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_PROVIDER_OPTIONS = '{not json}'
+  assert.throws(() => loadConfig(), /AGENT_PROVIDER_OPTIONS must be valid JSON/)
+})
+
+test('loadConfig rejects AGENT_PROVIDER_OPTIONS that is not a plain object', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_PROVIDER_OPTIONS = '["a","b"]'
+  assert.throws(() => loadConfig(), /AGENT_PROVIDER_OPTIONS must be a JSON object/)
+})
+
+test('loadConfig threads AGENT_PLANNER_PROVIDER_OPTIONS into the planner override', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_PLANNER_PROVIDER_OPTIONS = '{"accountId":"acc-from-env"}'
+  const c = loadConfig()
+  assert.deepEqual(c.planner, {
+    providerType: undefined,
+    baseURL: undefined,
+    apiKey: undefined,
+    providerOptions: { accountId: 'acc-from-env' },
+  })
 })

@@ -1,3 +1,4 @@
+import type { LanguageModel } from 'ai'
 import type { IAgentInternalContext } from './internal.ts'
 import { connectMcpServers, filterTools } from './mcp.ts'
 import { buildModelFromStage, resolveStage } from './provider.ts'
@@ -43,7 +44,13 @@ export interface ICloseOptions {
   // before tearing down MCP connections. Default false: close immediately and
   // let active runs fail mid-flight (the legacy behavior).
   waitForRuns?: boolean
-  // Maximum time to wait for active runs when waitForRuns is true. Default 30s.
+  // Cap, in ms, applied to the entire close() call:
+  //   1. when waitForRuns is true: max time spent waiting for active runs to
+  //      drain;
+  //   2. ALWAYS: max time spent on the underlying MCP transport teardown
+  //      (some HTTP/SSE transports can hang on close if the peer is
+  //      unresponsive). After this elapses close() resolves anyway and the
+  //      transport is abandoned to GC. Default 30s.
   timeoutMs?: number
 }
 
@@ -205,17 +212,38 @@ export const createAgent = async (
   // override any field (provider, baseURL, apiKey, model) via the dedicated
   // override blocks. Legacy plannerModel / synthesizerModel still work as
   // model-only shortcuts when the override block is absent.
-  const executorStage = resolveStage(config, undefined, undefined, 'executor')
-  const plannerStage = resolveStage(config, config.planner, config.plannerModel, 'planner')
-  const synthesizerStage = resolveStage(
-    config,
-    config.synthesizer,
-    config.synthesizerModel,
-    'synthesizer',
-  )
-  const executorModel = buildModelFromStage(config.clientName, executorStage)
-  const plannerModel = buildModelFromStage(config.clientName, plannerStage)
-  const synthesizerModel = buildModelFromStage(config.clientName, synthesizerStage)
+  //
+  // Provider SDKs are dynamically imported (peerDependencies, optional), so
+  // model construction is async; build all three in parallel since they are
+  // independent. On failure (e.g. missing peer dep) we MUST close the MCP
+  // connection opened above - otherwise we leak open transports for what is
+  // typically a misconfiguration retry-loop.
+  let executorModel: LanguageModel
+  let plannerModel: LanguageModel
+  let synthesizerModel: LanguageModel
+  try {
+    const executorStage = resolveStage(config, undefined, undefined, 'executor')
+    const plannerStage = resolveStage(config, config.planner, config.plannerModel, 'planner')
+    const synthesizerStage = resolveStage(
+      config,
+      config.synthesizer,
+      config.synthesizerModel,
+      'synthesizer',
+    )
+    ;[executorModel, plannerModel, synthesizerModel] = await Promise.all([
+      buildModelFromStage(config.clientName, executorStage),
+      buildModelFromStage(config.clientName, plannerStage),
+      buildModelFromStage(config.clientName, synthesizerStage),
+    ])
+  } catch (err) {
+    await connected.connection.close().catch(() => {})
+    emit({
+      type: 'error',
+      error: err instanceof Error ? err : new Error(String(err)),
+      phase: 'init',
+    })
+    throw err
+  }
 
   const ctx: IAgentInternalContext = {
     config,
@@ -375,12 +403,16 @@ export const createAgent = async (
       closed = true
       const waitForRuns = options?.waitForRuns ?? false
       const timeoutMs = options?.timeoutMs ?? 30_000
+      // Single budget shared by both phases: waiting for runs to drain (if
+      // requested) and the MCP transport teardown. Whatever waitForRuns
+      // consumes is subtracted from what's available to the close itself,
+      // with a small floor so the transport always gets *some* chance.
+      const deadline = Date.now() + timeoutMs
       if (waitForRuns && activeRuns > 0) {
-        const start = Date.now()
         // Poll instead of using EventEmitter to avoid coupling close() to
         // event-handler ordering; activeRuns flips back to 0 after the run's
         // try/finally regardless.
-        while (activeRuns > 0 && Date.now() - start < timeoutMs) {
+        while (activeRuns > 0 && Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, 50))
         }
       }
@@ -391,7 +423,48 @@ export const createAgent = async (
           message: `[agent] close called with ${activeRuns} active run(s); they will fail mid-flight`,
         })
       }
-      await connected.connection.close().catch(() => {})
+      // Race the MCP teardown against the remaining budget. An unresponsive
+      // HTTP/SSE peer can leave client.close() pending forever; the timeout
+      // guarantees close() itself resolves so callers (CLIs, test fixtures)
+      // never hang. Transports abandoned this way are GC'd when the agent is.
+      //
+      // Two tripwires we MUST get right:
+      //   1. clearTimeout when MCP wins the race - otherwise the timer keeps
+      //      the event loop alive for the FULL closeBudget after close()
+      //      returned, and processes that called close() at the end of main
+      //      visibly hang. Verified manually: with 5s budget the process
+      //      exited 5s late before this clear.
+      //   2. timeoutId.unref() - belt and suspenders so even an exception in
+      //      the race body cannot pin the loop.
+      //
+      // No artificial floor: timeoutMs is a hard cap on the whole close()
+      // call (per ICloseOptions docs). If waitForRuns already burned the
+      // budget, we hand the teardown a 0ms slot - setTimeout(_, 0) still
+      // schedules to the next tick, so transports that finish synchronously
+      // can still win, but nothing here will exceed timeoutMs.
+      const closeBudget = Math.max(deadline - Date.now(), 0)
+      let timedOut = false
+      let timeoutId: ReturnType<typeof setTimeout> | undefined
+      await Promise.race([
+        connected.connection.close().catch(() => {}),
+        new Promise<void>((resolve) => {
+          timeoutId = setTimeout(() => {
+            timedOut = true
+            resolve()
+          }, closeBudget)
+          timeoutId.unref?.()
+        }),
+      ])
+      if (timeoutId) {
+        clearTimeout(timeoutId)
+      }
+      if (timedOut) {
+        emit({
+          type: 'log',
+          level: 'warn',
+          message: `[agent] MCP teardown exceeded ${closeBudget}ms; abandoning transport(s)`,
+        })
+      }
     },
     activeRuns: () => activeRuns,
   }

@@ -13,7 +13,7 @@ export const HELP = `Usage: dd-agent [options]
 
 Options:
   --env-file=<path>             Load env vars from a dotenv file before starting
-  --provider=<type>             AGENT_PROVIDER_TYPE (openai|anthropic|google|openai-compatible)
+  --provider=<type>             AGENT_PROVIDER_TYPE (see "Required env vars" below for the full list)
   --model=<id>                  AGENT_MODEL
   --planner-model=<id>          AGENT_PLANNER_MODEL
   --synthesizer-model=<id>      AGENT_SYNTHESIZER_MODEL
@@ -28,7 +28,8 @@ API keys are still read from env (AGENT_API_KEY etc.) - we deliberately do
 not accept them as flags so they don't end up in shell history.
 
 Required env vars (set directly or via --env-file):
-  AGENT_PROVIDER_TYPE   one of: openai | anthropic | openai-compatible | google
+  AGENT_PROVIDER_TYPE   openai | anthropic | google | openai-compatible | xai | azure |
+                        amazon-bedrock | google-vertex | deepseek | gateway | cloudflare
   AGENT_API_KEY         provider API key
   AGENT_MODEL           model id
   MCP_SERVERS           JSON: { "<name>": { "url": "...", "headers"?: {...} } | { "command": "...", "args"?: [], "env"?: {} } }

@@ -157,19 +157,37 @@ export const runRepl = async (): Promise<void> => {
 
   const rl = createInterface({ input, output })
   const history: IConversationTurn[] = []
-  let abortController: AbortController | null = null
+  let runController: AbortController | null = null
+  let inputController: AbortController | null = null
 
   // Use process-level SIGINT instead of rl.on('SIGINT'): the latter only fires
   // while rl.question() is actively reading. During `await agent.run(...)`
   // readline is idle, so Ctrl-C would otherwise hit Node's default handler
-  // (terminate). With this listener Ctrl-C cancels the run if one is active,
-  // and gracefully closes the REPL otherwise.
+  // (terminate). With this listener:
+  //   - Ctrl-C during a run: aborts the run via runController.
+  //   - Ctrl-C at the prompt: aborts the rl.question() via inputController,
+  //     which makes the await reject with AbortError - the loop catches it
+  //     and breaks cleanly. (Just calling rl.close() does NOT always reject
+  //     a pending question() in node:readline/promises, which is what made
+  //     Ctrl-C "hang" before this fix.)
+  //   - Double Ctrl-C: hard exit. agent.close() against an unresponsive MCP
+  //     transport can itself hang; the second Ctrl-C is the user's escape
+  //     hatch out of the cleanup phase.
+  let sigIntCount = 0
   const onSigInt = () => {
-    if (abortController) {
+    sigIntCount++
+    if (sigIntCount >= 2) {
+      console.log('\n[abort] forcing exit')
+      process.exit(130)
+    }
+    if (runController) {
       console.log('\n[abort] cancelling current run...')
-      abortController.abort()
-    } else {
-      rl.close()
+      runController.abort()
+      return
+    }
+    if (inputController) {
+      inputController.abort()
+      return
     }
   }
   process.on('SIGINT', onSigInt)
@@ -177,10 +195,19 @@ export const runRepl = async (): Promise<void> => {
   try {
     while (true) {
       let prompt: string
+      inputController = new AbortController()
       try {
-        prompt = (await rl.question('\nyou> ')).trim()
-      } catch {
+        prompt = (await rl.question('\nyou> ', { signal: inputController.signal })).trim()
+        sigIntCount = 0
+      } catch (err) {
+        if ((err as { name?: string })?.name === 'AbortError') {
+          // Ctrl-C at the prompt is the canonical way out of the REPL.
+          break
+        }
+        // Any other rejection (e.g. stdin EOF) - bail out the same way.
         break
+      } finally {
+        inputController = null
       }
       if (!prompt) {
         continue
@@ -239,13 +266,14 @@ export const runRepl = async (): Promise<void> => {
 
       streamingFinal = false
       streamingThought = false
-      abortController = new AbortController()
+      runController = new AbortController()
       try {
         const result = await agent.run({
           input: prompt,
           history,
-          signal: abortController.signal,
+          signal: runController.signal,
         })
+        sigIntCount = 0
         history.push({ role: 'user', content: prompt })
         history.push({ role: 'assistant', content: result.text })
         while (history.length > HISTORY_LIMIT) {
@@ -257,16 +285,23 @@ export const runRepl = async (): Promise<void> => {
       } catch (err) {
         if ((err as { name?: string })?.name === 'AbortError') {
           console.log('[abort] run cancelled')
+          sigIntCount = 0
         } else {
           console.error('[error]', (err as Error).message)
         }
       } finally {
-        abortController = null
+        runController = null
       }
     }
   } finally {
     process.off('SIGINT', onSigInt)
     rl.close()
-    await agent.close().catch((err: unknown) => console.error('[cleanup] agent', err))
+    // Library-side timeout caps both the (skipped here) wait for active runs
+    // AND the MCP transport teardown, so close() can never hang the CLI.
+    // The double-Ctrl-C escape hatch in onSigInt is the user's belt-and-
+    // suspenders against any tighter unresponsiveness.
+    await agent
+      .close({ timeoutMs: 5_000 })
+      .catch((err: unknown) => console.error('[cleanup] agent', err))
   }
 }
