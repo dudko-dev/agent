@@ -21,9 +21,14 @@ export const PlanStepSchema = z.object({
     .describe('Tool names from the available list, if any'),
 })
 
+// NOTE: no .max() on steps — Anthropic's native structured output
+// (output_config.format.schema) rejects `maxItems` on array types. The cap
+// is enforced via the planner prompt ("hard cap is 8") and a slice() below.
+export const PLAN_STEP_HARD_CAP = 8
+
 export const PlanSchema = z.object({
   thought: z.string().min(1).describe('One-paragraph reasoning about how to approach the request'),
-  steps: z.array(PlanStepSchema).min(1).max(8),
+  steps: z.array(PlanStepSchema).min(1),
 })
 
 export const createInitialPlan = async (
@@ -50,9 +55,18 @@ export const createInitialPlan = async (
     ctx.emit({ type: 'usage', phase: 'plan', usage })
     span.setAttribute(ATTR.USAGE_TOTAL_TOKENS, usage.totalTokens)
 
+    const cappedSteps = object.steps.slice(0, PLAN_STEP_HARD_CAP)
+    if (cappedSteps.length < object.steps.length) {
+      ctx.emit({
+        type: 'log',
+        level: 'warn',
+        message: `[plan] model returned ${object.steps.length} steps; truncated to hard cap ${PLAN_STEP_HARD_CAP}`,
+      })
+    }
+
     return {
       thought: object.thought,
-      steps: object.steps.map((s) => {
+      steps: cappedSteps.map((s) => {
         if (!s.suggestedTools?.length) {
           return s
         }
