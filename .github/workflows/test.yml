@@ -5,8 +5,6 @@ on:
     branches: [main]
   push:
     branches: [main]
-  # Lets a maintainer re-run the suite from the Actions tab without pushing,
-  # e.g. to verify a flaky test passes against the current main HEAD.
   workflow_dispatch:
 
 jobs:
@@ -19,28 +17,13 @@ jobs:
       matrix:
         node-version: ['22', '24']
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Format check
-        run: npm run format:check
-
-      # Build before tests so the dist-loadable suite can verify both the
-      # CJS and ESM bundles actually load (it skips itself on a clean tree).
-      - name: Build
-        run: npm run build
-
-      - name: Test
-        run: npm test
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run format:check
+      - run: npm run build
+      - run: npm test
