@@ -91,7 +91,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "@opentelemetry/api": "^1.9.1",
-    "ai": "^6.0.177",
+    "ai": "^6.0.183",
     "zod": "^4.4.3"
   },
   "peerDependencies": {
@@ -139,15 +139,15 @@
     }
   },
   "devDependencies": {
-    "@ai-sdk/amazon-bedrock": "^4.0.103",
-    "@ai-sdk/anthropic": "^3.0.76",
-    "@ai-sdk/azure": "^3.0.64",
-    "@ai-sdk/deepseek": "^2.0.34",
-    "@ai-sdk/google": "^3.0.71",
-    "@ai-sdk/google-vertex": "^4.0.125",
-    "@ai-sdk/openai": "^3.0.63",
+    "@ai-sdk/amazon-bedrock": "^4.0.107",
+    "@ai-sdk/anthropic": "^3.0.78",
+    "@ai-sdk/azure": "^3.0.65",
+    "@ai-sdk/deepseek": "^2.0.35",
+    "@ai-sdk/google": "^3.0.74",
+    "@ai-sdk/google-vertex": "^4.0.129",
+    "@ai-sdk/openai": "^3.0.64",
     "@ai-sdk/openai-compatible": "^2.0.47",
-    "@ai-sdk/xai": "^3.0.89",
+    "@ai-sdk/xai": "^3.0.90",
     "@types/node": "^22.9.0",
     "prettier": "^3.8.3",
     "tsup": "^8.5.1",
