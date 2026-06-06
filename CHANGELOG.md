@@ -1,3 +1,8 @@
+# 0.0.13 / 2026-06-06
+
+### :tada: Enhancements
+- Updated dependencies: @ai-sdk/amazon-bedrock, @ai-sdk/azure, @ai-sdk/google-vertex, @ai-sdk/openai, @ai-sdk/xai, ai
+
 # 0.0.12 / 2026-05-30
 
 ### :tada: Enhancements
