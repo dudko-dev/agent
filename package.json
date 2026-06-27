@@ -156,5 +156,10 @@
   },
   "engines": {
     "node": ">=22.6.0"
+  },
+  "overrides": {
+    "workers-ai-provider": {
+      "ai": "$ai"
+    }
   }
 }
