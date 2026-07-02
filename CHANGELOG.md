@@ -1,3 +1,8 @@
+# 0.0.16 / 2026-07-02
+
+### :tada: Enhancements
+- README: cross-link to the browser sibling package [`@dudko.dev/agent-web`](https://www.npmjs.com/package/@dudko.dev/agent-web)
+
 # 0.0.15 / 2026-06-20
 
 ### :tada: Enhancements
