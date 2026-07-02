@@ -8,6 +8,12 @@ This lightweight, opinionated planning agent automates complex workflows by orch
 ![GitHub last commit](https://img.shields.io/github/last-commit/dudko-dev/agent.svg)
 ![GitHub release](https://img.shields.io/github/release/dudko-dev/agent.svg)
 
+> Node/server sibling of the **browser** package
+> [`@dudko.dev/agent-web`](https://www.npmjs.com/package/@dudko.dev/agent-web) —
+> the same plan → execute → replan → synthesize loop running fully in-browser
+> (BYOK cloud providers or local WebGPU/WebLLM models, encrypted IndexedDB
+> token vault, HTTP MCP).
+
 The agent runs a plan → execute → replan → synthesize loop:
 
 1. **Plan** — the planner LLM produces a structured plan (a thought + ordered steps with optional suggested tools).
