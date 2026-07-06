@@ -180,6 +180,7 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 | `maxIterations` | Cap on **executed steps** across the run (every step counts, including those run after a `revise`). |
 | `maxStepsPerTask` | Cap on LLM steps inside a single executor call (multi-step tool calling). |
 | `maxRevisions` | Cap on `revise` decisions the replanner can make per run. Default `2`. |
+| `replanAfter` | Replan trigger: `'failure'` (default; blocked step or a tool failure that stayed failed) \| `'always'` \| `(stepResult) => boolean \| Promise<boolean>` (bounded by `llmTimeoutMs`; falls back to `'failure'` on error). |
 | `maxTotalTokens` | Soft cap on cumulative input + output tokens; checked between steps and triggers an early jump to synthesis when crossed. |
 | `llmTimeoutMs` / `llmMaxRetries` | Per-LLM-call timeout and retry budget. |
 | `toolSelectionStrategy` | `'all'` (default) gives the executor every tool each step; `'plan-narrowed'` exposes only `step.suggestedTools`. |

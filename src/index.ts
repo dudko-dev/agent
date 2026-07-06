@@ -36,6 +36,7 @@ export type {
   LogLevel,
   ProviderType,
   ReplanCause,
+  ReplanTrigger,
   ToolSelectionStrategy,
 } from './types.ts'
 

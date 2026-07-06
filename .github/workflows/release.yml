@@ -52,13 +52,23 @@ jobs:
             echo "publish=true" >>"$GITHUB_OUTPUT"
             echo "::notice::Will publish ${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }}."
           fi
+      # Preferred: npm Trusted Publishing (OIDC), no secret needed. Fallback:
+      # the NPM_TOKEN secret — npm only reads a token from .npmrc (a
+      # NODE_AUTH_TOKEN env var alone is ignored), so write .npmrc explicitly,
+      # and only when the secret is set (an empty _authToken breaks OIDC).
       - if: steps.check.outputs.publish == 'true'
         run: |
           set -euo pipefail
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >>"$HOME/.npmrc"
+            echo "::notice::Publishing with the NPM_TOKEN secret (fallback)."
+          else
+            echo "::notice::No NPM_TOKEN secret; relying on npm Trusted Publishing (OIDC)."
+          fi
           npx -y npm@11.5.1 --version
           npx -y npm@11.5.1 publish --provenance
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       - if: steps.check.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
