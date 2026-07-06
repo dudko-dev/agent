@@ -111,6 +111,19 @@ export interface IAgentConfig {
   maxStepsPerTask: number
   // Cap on the number of "revise" decisions the replanner can make per run.
   maxRevisions?: number
+  // What makes the LLM replanner run after a step (it never runs after the
+  // last planned step):
+  //   'failure' (default) - the step was blocked, or a tool call failed and
+  //     stayed failed (a later successful call to the same tool within the
+  //     step counts as self-corrected);
+  //   'always' - after every step, e.g. when the host surfaces problems to
+  //     the replanner through systemPrompt/domain context (costs one extra
+  //     LLM call per step);
+  //   predicate - decides per step result; may be async and close over host
+  //     state. A predicate that throws, rejects, or outlives llmTimeoutMs /
+  //     the run signal falls back to the 'failure' rule, so a buggy or hung
+  //     predicate can never stall the run.
+  replanAfter?: ReplanTrigger
   // Soft cap on cumulative tokens; checked between steps and triggers an
   // early jump to synthesis when crossed.
   maxTotalTokens?: number
@@ -196,6 +209,12 @@ export interface IStepResult {
   // [BLOCKER] sentinel in its reply). The replanner is invoked on this signal.
   blocked: boolean
 }
+
+// When the LLM replanner is consulted after a step; see IAgentConfig.replanAfter.
+export type ReplanTrigger =
+  | 'failure'
+  | 'always'
+  | ((result: IStepResult) => boolean | Promise<boolean>)
 
 export type ReplanCause = 'last-step' | 'clean-step' | 'llm-decision'
 

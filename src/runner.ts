@@ -17,24 +17,102 @@ import type {
   IRunSnapshot,
   IStepResult,
   IUsage,
+  ReplanTrigger,
 } from './types.ts'
 import { ATTR, withSpan } from './tracing.ts'
 import { combineSignals } from './utils.ts'
 
-// Replanner is invoked when:
+// The default ('failure') replan trigger fires when:
 //   - the executor explicitly signalled a blocker (via the [BLOCKER] sentinel,
 //     decoded into result.blocked); or
-//   - any tool call in this step failed.
+//   - a tool call in this step failed and STAYED failed. A failure that a
+//     later call to the same tool retried successfully is self-corrected -
+//     the executor's multi-step loop already recovered, so it must not force
+//     a replan.
 // Both signals are language-independent and structural, so we don't parse the
 // summary's prose. shouldCallReplanner is exported for direct unit testing.
 export const shouldCallReplanner = (result: IStepResult): boolean => {
   if (result.blocked) {
     return true
   }
-  if (result.toolCalls.some((c) => !c.ok)) {
+  const { toolCalls } = result
+  return toolCalls.some(
+    (c, i) => !c.ok && !toolCalls.slice(i + 1).some((later) => later.ok && later.name === c.name),
+  )
+}
+
+export interface IReplanTriggerOptions {
+  signal?: AbortSignal
+  timeoutMs?: number
+  // Called with whatever a host predicate threw before falling back to 'failure'.
+  onError?: (err: unknown) => void
+}
+
+// Resolve the configured `replanAfter` trigger for one step result. 'failure'
+// is the classic shouldCallReplanner; 'always' consults the replanner after
+// every step; a host predicate decides per result. A predicate that throws,
+// rejects, or outlives the watchdog/abort falls back to 'failure' behaviour so
+// a buggy or hung predicate can never stall the run.
+export const replanTriggered = async (
+  trigger: ReplanTrigger | undefined,
+  result: IStepResult,
+  opts: IReplanTriggerOptions = {},
+): Promise<boolean> => {
+  if (trigger === 'always') {
     return true
   }
-  return false
+  if (typeof trigger !== 'function') {
+    return shouldCallReplanner(result)
+  }
+  const fallback = (): boolean => shouldCallReplanner(result)
+  const { signal } = opts
+  const timeoutMs = opts.timeoutMs ?? 0
+  if (signal?.aborted) {
+    return fallback()
+  }
+  // Never rejects: a sync throw or async rejection resolves to the fallback.
+  const decided = (async (): Promise<boolean> => {
+    try {
+      return Boolean(await trigger(result))
+    } catch (err) {
+      opts.onError?.(err)
+      return fallback()
+    }
+  })()
+  const hasTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0
+  if (!hasTimeout && !signal) {
+    // No watchdog configured - just await the predicate.
+    return decided
+  }
+  // Watchdog: fall back when the timeout elapses or the run aborts. We use a
+  // ref'd setTimeout rather than AbortSignal.timeout on purpose - an
+  // AbortSignal.timeout timer is unref'd, so a hung predicate on an otherwise
+  // idle event loop could let the process exit before the fallback lands
+  // (and node:test on Node 22 tears the loop down early, cancelling the test).
+  // A ref'd timer keeps the loop alive until the fallback resolves.
+  return new Promise<boolean>((resolve) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (value: boolean): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer !== undefined) {
+        clearTimeout(timer)
+      }
+      signal?.removeEventListener('abort', onAbort)
+      resolve(value)
+    }
+    function onAbort(): void {
+      finish(fallback())
+    }
+    if (hasTimeout) {
+      timer = setTimeout(() => finish(fallback()), timeoutMs)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    decided.then(finish, () => finish(fallback()))
+  })
 }
 
 const isAbortError = (err: unknown): boolean =>
@@ -418,11 +496,24 @@ const runAgentLoopInner = async (
       break
     }
 
-    if (!shouldCallReplanner(result)) {
+    // The trigger is host-configurable (replanAfter); a predicate is bounded
+    // by the same watchdog/abort as an LLM call and falls back to the
+    // 'failure' rule on error, so it can never stall the run.
+    const wantReplanner = await replanTriggered(ctx.config.replanAfter, result, {
+      signal,
+      timeoutMs: ctx.config.llmTimeoutMs ?? 0,
+      onError: (err) =>
+        proxiedCtx.emit({
+          type: 'log',
+          level: 'warn',
+          message: `[runner] replanAfter predicate threw - using the failure rule: ${(err as Error).message}`,
+        }),
+    })
+    if (!wantReplanner) {
       proxiedCtx.emit({
         type: 'replan.decision',
         mode: 'continue',
-        reason: 'step succeeded cleanly, skipping LLM replanner',
+        reason: 'replan trigger not met, skipping LLM replanner',
         cause: 'clean-step',
       })
       stepIndex++

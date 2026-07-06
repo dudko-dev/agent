@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { resolveResume, shouldCallReplanner } from '../src/runner.ts'
+import { replanTriggered, resolveResume, shouldCallReplanner } from '../src/runner.ts'
 import type { IAgentInternalContext } from '../src/internal.ts'
 import type { IAgentConfig, IPersistence, IRunSnapshot, IStepResult } from '../src/types.ts'
 
@@ -42,6 +42,49 @@ test('shouldCallReplanner ignores summary prose entirely (no language bias)', ()
     shouldCallReplanner(result({ summary: 'I cannot find the project anywhere.' })),
     false,
   )
+})
+
+test('shouldCallReplanner treats a later successful retry of the same tool as resolved', () => {
+  const fail = { name: 't', input: {}, output: 'err', ok: false }
+  const okSame = { name: 't', input: {}, output: 'data', ok: true }
+  const okOther = { name: 'other', input: {}, output: 'data', ok: true }
+  // Self-corrected within the executor's multi-step loop - no replan.
+  assert.equal(shouldCallReplanner(result({ toolCalls: [fail, okSame] })), false)
+  // A success of a DIFFERENT tool does not resolve the failure.
+  assert.equal(shouldCallReplanner(result({ toolCalls: [fail, okOther] })), true)
+  // The failure came after the success - still failed at step end.
+  assert.equal(shouldCallReplanner(result({ toolCalls: [okSame, fail] })), true)
+})
+
+test("replanTriggered resolves 'failure' | 'always' | predicate", async () => {
+  const clean = result({ toolCalls: [{ name: 't', input: {}, output: 1, ok: true }] })
+  const failed = result({ toolCalls: [{ name: 't', input: {}, output: 'e', ok: false }] })
+  assert.equal(await replanTriggered(undefined, clean), false)
+  assert.equal(await replanTriggered('failure', failed), true)
+  assert.equal(await replanTriggered('always', clean), true)
+  // The predicate wins in both directions.
+  assert.equal(await replanTriggered(async () => true, clean), true)
+  assert.equal(await replanTriggered(() => false, failed), false)
+})
+
+test('replanTriggered: a throwing predicate falls back to the failure rule', async () => {
+  const failed = result({ toolCalls: [{ name: 't', input: {}, output: 'e', ok: false }] })
+  const clean = result({})
+  const errors: unknown[] = []
+  const boom = () => {
+    throw new Error('boom')
+  }
+  assert.equal(await replanTriggered(boom, failed, { onError: (e) => errors.push(e) }), true)
+  assert.equal(await replanTriggered(boom, clean), false)
+  assert.equal(errors.length, 1)
+  assert.match((errors[0] as Error).message, /boom/)
+})
+
+test('replanTriggered: a hung predicate is bounded by the watchdog', async () => {
+  const failed = result({ toolCalls: [{ name: 't', input: {}, output: 'e', ok: false }] })
+  const never = () => new Promise<boolean>(() => {})
+  // Falls back to the failure rule when the predicate outlives timeoutMs.
+  assert.equal(await replanTriggered(never, failed, { timeoutMs: 20 }), true)
 })
 
 const baseConfig = (overrides: Partial<IAgentConfig> = {}): IAgentConfig => ({
