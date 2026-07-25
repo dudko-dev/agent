@@ -212,9 +212,7 @@ export interface IStepResult {
 
 // When the LLM replanner is consulted after a step; see IAgentConfig.replanAfter.
 export type ReplanTrigger =
-  | 'failure'
-  | 'always'
-  | ((result: IStepResult) => boolean | Promise<boolean>)
+  'failure' | 'always' | ((result: IStepResult) => boolean | Promise<boolean>)
 
 export type ReplanCause = 'last-step' | 'clean-step' | 'llm-decision'
 

@@ -1,3 +1,8 @@
+# 0.0.18 / 2026-07-25
+
+### :tada: Enhancements
+- Updated dependencies: @ai-sdk/amazon-bedrock, @ai-sdk/anthropic, @ai-sdk/azure, @ai-sdk/deepseek, @ai-sdk/google, @ai-sdk/google-vertex, @ai-sdk/openai, @ai-sdk/openai-compatible, @ai-sdk/xai, ai, prettier, typescript, workers-ai-provider
+
 # 0.0.16 / 2026-07-02
 
 ### :tada: Enhancements
