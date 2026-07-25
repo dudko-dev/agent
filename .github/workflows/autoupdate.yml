@@ -148,7 +148,8 @@ jobs:
                 npm test
 
           Claude will leave a status comment on this PR when it finishes.
-          PR-checks will re-run on each new commit.
+          The Claude workflow re-dispatches PR-checks once it is done, so the
+          checks below reflect its pushed fixes.
           EOF
           )
           PR_URL=$(gh pr create \
@@ -181,6 +182,7 @@ jobs:
           gh pr checks "$PR_URL" --watch || true
           gh pr checks "$PR_URL" 2>/dev/null | grep -qE '\s+fail\b' && { echo "checks failed"; exit 1; }
           gh pr merge "$PR_URL" --squash --delete-branch
+
       - name: Dispatch Claude to fix the failed autoupdate
         if: steps.pr_failure.outputs.pr_url != ''
         env:
