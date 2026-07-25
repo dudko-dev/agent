@@ -91,7 +91,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "@opentelemetry/api": "^1.9.1",
-    "ai": "^7.0.31",
+    "ai": "^7.0.37",
     "zod": "^4.4.3"
   },
   "peerDependencies": {
@@ -139,20 +139,20 @@
     }
   },
   "devDependencies": {
-    "@ai-sdk/amazon-bedrock": "^4.0.119",
-    "@ai-sdk/anthropic": "^3.0.85",
-    "@ai-sdk/azure": "^3.0.76",
-    "@ai-sdk/deepseek": "^2.0.39",
-    "@ai-sdk/google": "^3.0.83",
-    "@ai-sdk/google-vertex": "^4.0.147",
-    "@ai-sdk/openai": "^3.0.73",
-    "@ai-sdk/openai-compatible": "^2.0.51",
-    "@ai-sdk/xai": "^3.0.96",
+    "@ai-sdk/amazon-bedrock": "^5.0.31",
+    "@ai-sdk/anthropic": "^4.0.20",
+    "@ai-sdk/azure": "^4.0.21",
+    "@ai-sdk/deepseek": "^3.0.13",
+    "@ai-sdk/google": "^4.0.24",
+    "@ai-sdk/google-vertex": "^5.0.30",
+    "@ai-sdk/openai": "^4.0.20",
+    "@ai-sdk/openai-compatible": "^3.0.14",
+    "@ai-sdk/xai": "^4.0.18",
     "@types/node": "^22.9.0",
-    "prettier": "^3.8.4",
+    "prettier": "^3.9.6",
     "tsup": "^8.5.1",
-    "typescript": "^6.0.3",
-    "workers-ai-provider": "^3.2.0"
+    "typescript": "^7.0.2",
+    "workers-ai-provider": "^4.0.0"
   },
   "engines": {
     "node": ">=22.6.0"
