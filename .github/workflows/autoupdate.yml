@@ -188,6 +188,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh workflow run pr-checks.yml --ref "$AUTOUPDATE_BRANCH" || true
+          gh workflow run test.yml --ref "$AUTOUPDATE_BRANCH" || true
       - name: Wait for PR checks and merge (autoupdater succeeded)
         id: merge_pr
         if: steps.pr_success.outputs.pr_url != ''
