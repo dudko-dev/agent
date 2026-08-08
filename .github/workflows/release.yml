@@ -1,7 +1,12 @@
 name: Release
 on:
   workflow_run:
-    workflows: [PR checks]
+    # Must watch CI (test.yml), not PR checks: pr-checks.yml is declared
+    # `push: branches-ignore: [main]`, so it never runs on main, and its
+    # pull_request runs are attributed to the PR branch. `branches: [main]`
+    # therefore matched nothing and this trigger could never fire -- the last
+    # automatic release was in May, every one since was dispatched by hand.
+    workflows: [CI]
     branches: [main]
     types: [completed]
   workflow_dispatch:
