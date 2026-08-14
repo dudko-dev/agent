@@ -28,14 +28,29 @@ const PROVIDERS: ProviderType[] = [
   'gateway',
 ]
 
+// Some provider SDKs read a `*_BASE_URL` fallback straight from the
+// environment and reject an empty string (as opposed to unset) with a
+// validation error. Clear those so an ambient blank value in the host shell
+// doesn't fail a test that never asked for a custom baseURL.
+const AMBIENT_PROVIDER_ENV_KEYS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY']
+
 for (const providerType of PROVIDERS) {
   test(`buildModelFromStage returns a model object for provider=${providerType}`, async () => {
-    const model = await buildModelFromStage('test', {
-      providerType,
-      apiKey: 'k',
-      model: 'some-model',
-    })
-    assert.ok(model, 'expected a non-null model')
+    const envBackup = new Map(AMBIENT_PROVIDER_ENV_KEYS.map((k) => [k, process.env[k]]))
+    for (const k of AMBIENT_PROVIDER_ENV_KEYS) delete process.env[k]
+    try {
+      const model = await buildModelFromStage('test', {
+        providerType,
+        apiKey: 'k',
+        model: 'some-model',
+      })
+      assert.ok(model, 'expected a non-null model')
+    } finally {
+      for (const [k, v] of envBackup) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
   })
 }
 
