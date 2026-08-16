@@ -14,6 +14,15 @@ import type {
 
 export { getCurrentRunId, getCurrentRunSandbox } from './context.ts'
 export { redactHeaders } from './utils.ts'
+export {
+  beginMcpOAuth,
+  createNodeOAuthProvider,
+  FileOAuthStore,
+  finishMcpOAuth,
+  MemoryOAuthStore,
+  NodeOAuthProvider,
+} from './mcp-oauth.ts'
+export type { INodeOAuthProviderOptions, IOAuthRequestOptions, IOAuthStore } from './mcp-oauth.ts'
 
 export type {
   AgentEvent,

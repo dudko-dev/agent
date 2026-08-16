@@ -1,3 +1,5 @@
+import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
+import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js'
 import type { ToolSet } from 'ai'
 
 export type ProviderType =
@@ -22,14 +24,26 @@ export type LogLevel = 'none' | 'error' | 'warn' | 'info' | 'debug'
 //                   needs tools; empty means "reasoning-only step".
 export type ToolSelectionStrategy = 'all' | 'plan-narrowed'
 
-// Remote MCP server reached over StreamableHTTP/SSE.
+// Remote MCP server reached over StreamableHTTP. (Legacy HTTP+SSE servers -
+// the 2024-11-05 transport with a separate /sse endpoint - are NOT supported;
+// point this at a StreamableHTTP endpoint.)
 export interface IMcpHttpServerConfig {
   url: string
   headers?: Record<string, string>
   // Called at connect time (and on reconnect) to provide fresh request headers.
   // Use this when tokens rotate; combine with `agent.reconnect()` to refresh
-  // an expired Bearer.
+  // an expired Bearer. Note that it is resolved ONCE per connect - for tokens
+  // that expire mid-run, use `authProvider` instead.
   getHeaders?: () => Promise<Record<string, string>> | Record<string, string>
+  // Full OAuth 2.1: the SDK discovers the authorization server (RFC 9728),
+  // registers dynamically when the provider supports it (RFC 7591), attaches
+  // the access token, and REFRESHES it on a 401 before retrying the request.
+  // See `createNodeOAuthProvider` for a file-backed implementation, or supply
+  // any OAuthClientProvider of your own.
+  authProvider?: OAuthClientProvider
+  // Custom fetch for every HTTP request the transport and the OAuth flow make:
+  // corporate proxies, mTLS agents, instrumentation.
+  fetch?: FetchLike
 }
 
 // Local MCP server spawned as a child process. The transport speaks JSON-RPC
