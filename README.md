@@ -298,6 +298,27 @@ npm run format        # prettier --write
 npm run format:check  # prettier --check
 ```
 
+## Testing against a real model
+
+`npm test` never needs a key: the integration suite drives the whole loop over
+loopback against a scripted OpenAI-compatible endpoint, a real MCP server and a
+real authorization server.
+
+To run the same loop against an actual model, point it at any OpenAI-compatible
+endpoint — `llama-server`, Ollama, vLLM, anything:
+
+```bash
+llama-server -m qwen2.5-1.5b-instruct-q4_k_m.gguf --port 8080 --temp 0 --jinja
+
+AGENT_LIVE_MODEL_URL=http://127.0.0.1:8080/v1 \
+  node --test --experimental-strip-types tests/live-model.test.ts
+```
+
+CI runs this as a **gate on publishing** (`live-model.yml`, wired into
+`release.yml`), and on any PR that touches the dependency manifests. It asserts
+mechanics only — the loop finished, the model drove the MCP tool, the arguments
+parsed — never the wording, which would make it a coin flip.
+
 ## Behavior notes & limitations
 
 - **Module formats.** ESM is the primary target; the CJS build (`dist/index.cjs`) is best-effort and depends on upstream deps (`ai`, `@ai-sdk/*`, `@modelcontextprotocol/sdk`) keeping their CJS fallbacks. If they go pure-ESM, CJS will break — the dual-format guard in [`tests/dist-loadable.test.ts`](./tests/dist-loadable.test.ts) catches the regression on the next build.

@@ -1,0 +1,120 @@
+name: Live model
+
+# A smoke test against a REAL model, served locally by llama.cpp on the runner.
+# No hosted API and no key: the point is to catch the failures a scripted model
+# cannot show — a provider changing its wire format, a prompt drifting out of
+# what small models can follow, structured output no longer parsing.
+#
+# It gates the release rather than running nightly. A nightly run reports at
+# 3am on yesterday's commit and nobody reads it; the question this answers —
+# "does the agent still work with an actual model?" — matters at the moment
+# something is about to be published. It also runs on dependency PRs, which is
+# where upstream drift actually arrives.
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    # Dependency bumps (including the autoupdate flow's) are the realistic
+    # source of drift; ordinary source PRs are covered by the scripted suite.
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+
+# Pinned so a rerun behaves the same. Bump deliberately.
+#
+# 3B is the floor, measured rather than guessed: on this exact runtime a
+# Qwen2.5-1.5B never called the tool — it answered from imagination, once
+# reporting a tool's NAME as the secret — while the 3B called it and returned
+# the real value. See the note on the test's phrasing in live-model.test.ts.
+env:
+  LLAMA_IMAGE: ghcr.io/ggml-org/llama.cpp:server-b5350
+  MODEL_REPO: Qwen/Qwen2.5-3B-Instruct-GGUF
+  MODEL_FILE: qwen2.5-3b-instruct-q4_k_m.gguf
+
+jobs:
+  smoke:
+    name: Real model smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache the model weights
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .live-model
+          key: live-model-${{ env.MODEL_FILE }}
+
+      - name: Fetch the model
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .live-model
+          curl -fsSL -o ".live-model/$MODEL_FILE" \
+            "https://huggingface.co/$MODEL_REPO/resolve/main/$MODEL_FILE?download=true"
+          ls -la .live-model
+
+      - name: Start the model server
+        run: |
+          set -euo pipefail
+          # The official image rather than a release asset: asset names carry
+          # the build number and change shape between releases, so a pinned
+          # image tag is the thing that can actually be verified.
+          #
+          # Greedy sampling with a fixed seed, so a failure means the agent
+          # broke rather than the dice rolling differently. --jinja turns on
+          # the chat template's tool calling, which is the whole point.
+          docker run -d --name llama --network host \
+            -v "$PWD/.live-model:/models:ro" \
+            "$LLAMA_IMAGE" \
+            -m "/models/$MODEL_FILE" \
+            --host 127.0.0.1 --port 8080 \
+            --ctx-size 8192 --temp 0 --seed 42 --jinja
+          for _ in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:8080/health >/dev/null; then
+              echo "model server is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::the model server never became healthy"
+          docker logs llama | tail -50
+          exit 1
+
+      - name: Run the live-model smoke test
+        # One retry: a small model occasionally wanders, and a single stray run
+        # must not block a publish. A second failure is a real signal.
+        run: |
+          set -uo pipefail
+          for attempt in 1 2; do
+            echo "::group::attempt $attempt"
+            if node --test --experimental-strip-types --disable-warning=ExperimentalWarning \
+                 tests/live-model.test.ts; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::attempt $attempt failed"
+          done
+          exit 1
+        env:
+          AGENT_LIVE_MODEL_URL: http://127.0.0.1:8080/v1
+          AGENT_LIVE_MODEL: qwen2.5-3b-instruct
+
+      - name: Model server log
+        if: failure()
+        run: docker logs llama | tail -100

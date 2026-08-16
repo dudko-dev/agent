@@ -23,6 +23,13 @@ export interface ILocalMcpOptions {
 export interface ILocalMcp {
   /** The MCP endpoint to hand to `mcpServers[name].url`. */
   url: string
+  /**
+   * A value only this server knows, returned by the `secret` tool. A task that
+   * asks for it cannot be answered from the model's own knowledge, so "did the
+   * model actually use the tool?" has a factual answer rather than a stylistic
+   * one.
+   */
+  secret: string
   /** Arguments every tool call received, in order. */
   calls: { name: string; args: unknown }[]
   /** Tokens the authorization server currently accepts. */
@@ -65,6 +72,7 @@ const close = (server: Server): Promise<void> =>
  */
 export const startLocalMcp = async (opts: ILocalMcpOptions = {}): Promise<ILocalMcp> => {
   const calls: { name: string; args: unknown }[] = []
+  const secret = `zq-${Math.random().toString(36).slice(2, 8)}`
   const validTokens = new Set<string>()
   const grants: string[] = []
   let registrations = 0
@@ -134,6 +142,17 @@ export const startLocalMcp = async (opts: ILocalMcpOptions = {}): Promise<ILocal
         return { content: [{ type: 'text' as const, text: `echo:${text}` }] }
       },
     )
+    server.registerTool(
+      'secret',
+      {
+        description: 'Return the server-side secret code. There is no other way to learn it.',
+        inputSchema: {},
+      },
+      () => {
+        calls.push({ name: 'secret', args: {} })
+        return { content: [{ type: 'text' as const, text: secret }] }
+      },
+    )
     server.registerTool('boom', { description: 'Always fails', inputSchema: {} }, () => {
       calls.push({ name: 'boom', args: {} })
       return { content: [{ type: 'text' as const, text: 'kaboom' }], isError: true }
@@ -182,6 +201,7 @@ export const startLocalMcp = async (opts: ILocalMcpOptions = {}): Promise<ILocal
 
   return {
     url: mcpUrl,
+    secret,
     calls,
     validTokens,
     registrations: () => registrations,

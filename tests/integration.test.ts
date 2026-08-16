@@ -119,7 +119,7 @@ test('plan → execute → replan → synthesize, driving a real MCP server over
         .listTools()
         .map((t) => t.name)
         .sort(),
-      ['files__boom', 'files__echo'],
+      ['files__boom', 'files__echo', 'files__secret'],
       'the tool list came from the live server',
     )
 
@@ -209,7 +209,7 @@ test('OAuth: authorize once, then run against the protected server', async () =>
     })
 
     const agent = await open(baseConfig(llm.baseURL, mcp.url, { authProvider: provider }))
-    assert.equal(agent.listTools().length, 2, 'the tools arrived once authorized')
+    assert.equal(agent.listTools().length, 3, 'the tools arrived once authorized')
     const result = await agent.run({ input: 'Echo "hello" for me' })
     assert.equal(result.text, 'Echoed: hello')
     assert.deepEqual(mcp.calls, [{ name: 'echo', args: { text: 'hello' } }])
@@ -234,7 +234,7 @@ test('OAuth: a token that dies mid-run is refreshed and the tool call retried', 
       state: prompts[0].searchParams.get('state') ?? undefined,
     })
     const agent = await open(baseConfig(llm.baseURL, mcp.url, { authProvider: provider }))
-    assert.equal(agent.listTools().length, 2)
+    assert.equal(agent.listTools().length, 3)
 
     // The access token stops working after the connection is up — the case a
     // static Authorization header can never recover from.
