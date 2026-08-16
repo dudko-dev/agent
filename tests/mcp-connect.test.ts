@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, stat } from 'node:fs/promises'
+import { mkdtemp, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -9,7 +9,7 @@ import {
   finishMcpOAuth,
   MemoryOAuthStore,
 } from '../src/mcp-oauth.ts'
-import { connectMcpServers } from '../src/mcp.ts'
+import { connectMcpServers, filterTools } from '../src/mcp.ts'
 import type { IMcpServerConfig } from '../src/types.ts'
 
 // A fake remote MCP server + authorization server behind a mock fetch. This is
@@ -65,11 +65,14 @@ const createMockServer = (opts: MockOptions = {}) => {
     grants: [] as string[],
     issued: 1,
     lastCodeVerifier: undefined as string | undefined,
+    toolCalls: 0,
     lastRegistration: undefined as Record<string, unknown> | undefined,
     /** Set to answer the next token request with invalid_client. */
     rejectClient: false,
     /** Set to answer dynamic registration with invalid_client_metadata. */
     failRegistration: false,
+    /** Set to answer refresh_token grants with a transient 503. */
+    failRefresh: false,
   }
 
   const handleRpc = (msg: RpcMessage): unknown => {
@@ -94,6 +97,7 @@ const createMockServer = (opts: MockOptions = {}) => {
       return { jsonrpc: '2.0', id: msg.id, result: { tools } }
     }
     if (msg.method === 'tools/call') {
+      state.toolCalls += 1
       const params = (msg.params ?? {}) as { name?: string; arguments?: unknown }
       if (params.name === 'boom') {
         return {
@@ -106,7 +110,11 @@ const createMockServer = (opts: MockOptions = {}) => {
         jsonrpc: '2.0',
         id: msg.id,
         result: {
-          content: [{ type: 'text', text: `echo:${JSON.stringify(params.arguments ?? {})}` }],
+          // Echo the name the SERVER received, so a test asserting that a
+          // sanitized key still dispatches to the original name is real.
+          content: [
+            { type: 'text', text: `${params.name}:${JSON.stringify(params.arguments ?? {})}` },
+          ],
         },
       }
     }
@@ -179,11 +187,14 @@ const createMockServer = (opts: MockOptions = {}) => {
         if (params.get('code') !== 'auth-code-1') {
           return jsonResponse({ error: 'invalid_grant' }, 400)
         }
-      } else if (
-        grant === 'refresh_token' &&
-        !params.get('refresh_token')?.startsWith('refresh-')
-      ) {
-        return jsonResponse({ error: 'invalid_grant' }, 400)
+      } else if (grant === 'refresh_token') {
+        if (state.failRefresh) {
+          // A transient authorization-server outage, NOT a dead token.
+          return jsonResponse({ error: 'server_error' }, 503)
+        }
+        if (!params.get('refresh_token')?.startsWith('refresh-')) {
+          return jsonResponse({ error: 'invalid_grant' }, 400)
+        }
       }
       state.issued += 1
       const access = `access-${state.issued}`
@@ -273,6 +284,36 @@ test('connectMcpServers: an MCP result with isError becomes a failed tool call',
   await mcp.close()
 })
 
+test('connectMcpServers: a throwing outputSanitizer cannot turn isError into success', async () => {
+  const mock = createMockServer({ tools: [{ name: 'boom', inputSchema: { type: 'object' } }] })
+  const mcp = await connectMcpServers(
+    { docs: { url: MCP_URL, fetch: mock.fetchFn } },
+    silent as never,
+    'agent-test',
+    () => {
+      throw new Error('sanitizer exploded')
+    },
+  )
+  // The redaction placeholder must still arrive as a THROW: returning it would
+  // record ok: true for a call the server reported as failed.
+  await assert.rejects(() => callTool(mcp.tools, 'docs__boom', {}), /output redacted/)
+  await mcp.close()
+})
+
+test('connectMcpServers: a failed MCP call survives JSON serialization of the trace', async () => {
+  const mock = createMockServer({ tools: [{ name: 'boom', inputSchema: { type: 'object' } }] })
+  const mcp = await connect({ docs: { url: MCP_URL, fetch: mock.fetchFn } })
+  const err = await callTool(mcp.tools, 'docs__boom', {}).then(
+    () => undefined,
+    (e: unknown) => e,
+  )
+  // The AI SDK puts the thrown value on the tool-error part verbatim, and it
+  // ends up in IStepResult -> IPersistence. JSON.stringify(new Error()) is
+  // "{}", which would lose the server's message entirely.
+  assert.equal(JSON.parse(JSON.stringify({ output: err })).output, 'kaboom')
+  await mcp.close()
+})
+
 test('connectMcpServers: tool names are sanitized into the provider-safe alphabet', async () => {
   const mock = createMockServer({
     tools: [
@@ -284,7 +325,8 @@ test('connectMcpServers: tool names are sanitized into the provider-safe alphabe
   // "my docs" and both dotted/slashed tool names would be rejected outright by
   // OpenAI's ^[a-zA-Z0-9_-]{1,64}$; the collision is suffixed, not dropped.
   assert.deepEqual(Object.keys(mcp.tools), ['my_docs__files_read', 'my_docs__files_read_2'])
-  assert.equal(await callTool(mcp.tools, 'my_docs__files_read_2', { a: 1 }), 'echo:{"a":1}')
+  assert.equal(await callTool(mcp.tools, 'my_docs__files_read', { a: 1 }), 'files.read:{"a":1}')
+  assert.equal(await callTool(mcp.tools, 'my_docs__files_read_2', { a: 1 }), 'files/read:{"a":1}')
   await mcp.close()
 })
 
@@ -317,18 +359,32 @@ test('connectMcpServers: servers connect concurrently but mount in declaration o
   const gate = new Promise<void>((resolve) => {
     release = resolve
   })
+  let slowBlocked = false
+  let gatedOnce = false
   let overlapped = false
-  // "slow" blocks on the gate; "fast" opens it. If connects were sequential
-  // this would stall, so the fallback timer keeps the failure a clean assert.
-  const timer = setTimeout(release, 2000)
+  let fallbackFired = false
+  // "slow" blocks on its first request; "fast" releases it. Overlap is only
+  // recorded if fast's request lands WHILE slow is still blocked — a
+  // sequential connector would reach fast only after the fallback timer had
+  // unblocked slow, which the fallbackFired assertion then catches.
+  const timer = setTimeout(() => {
+    fallbackFired = true
+    release()
+  }, 2000)
   const slow = createMockServer({
-    gate: () => gate,
     tools: [{ name: 's', inputSchema: { type: 'object' } }],
+    gate: async () => {
+      if (gatedOnce) return
+      gatedOnce = true
+      slowBlocked = true
+      await gate
+      slowBlocked = false
+    },
   })
   const fast = createMockServer({
     tools: [{ name: 'f', inputSchema: { type: 'object' } }],
     onMcpRequest: () => {
-      overlapped = true
+      if (slowBlocked) overlapped = true
       release()
     },
   })
@@ -343,7 +399,8 @@ test('connectMcpServers: servers connect concurrently but mount in declaration o
   )
   clearTimeout(timer)
 
-  assert.equal(overlapped, true, 'the second server was reached before the first finished')
+  assert.equal(fallbackFired, false, 'the gate was opened by the second server, not by the timer')
+  assert.equal(overlapped, true, 'the second server was reached while the first was still blocked')
   assert.deepEqual(Object.keys(mcp.tools), ['slow__s', 'fast__f'], logger.lines.join(' | '))
   assert.deepEqual(
     mcp.results.map((r) => r.name),
@@ -363,6 +420,46 @@ test('connectMcpServers: one broken server does not stop the others', async () =
   })
   assert.equal(mcp.results.find((r) => r.name === 'dead')?.connected, false)
   assert.deepEqual(Object.keys(mcp.tools), ['docs__echo'])
+  await mcp.close()
+})
+
+test('connectMcpServers: two server names that sanitize alike keep both tool sets', async () => {
+  // "a.b" and "a/b" both sanitize to "a_b__": purging by prefix would unmount
+  // the first server's tools while leaving its catalogue rows, and route its
+  // name to the OTHER server's client.
+  const a = createMockServer()
+  const b = createMockServer()
+  const mcp = await connect({
+    'a.b': { url: MCP_URL, fetch: a.fetchFn },
+    'a/b': { url: MCP_URL, fetch: b.fetchFn },
+  })
+
+  assert.deepEqual(Object.keys(mcp.tools), ['a_b__echo', 'a_b__echo_2'])
+  assert.deepEqual(
+    mcp.catalog.map((c) => `${c.server}:${c.name}`),
+    ['a.b:a_b__echo', 'a/b:a_b__echo_2'],
+  )
+  await callTool(mcp.tools, 'a_b__echo_2', {})
+  assert.equal(b.state.toolCalls, 1, 'the suffixed key reaches the second server')
+  assert.equal(a.state.toolCalls, 0)
+  await mcp.close()
+})
+
+test('refreshServer: a nested server prefix is not swept away', async () => {
+  // "a__b" starts with "a__": a prefix purge while refreshing "a" would
+  // silently unmount every tool of the other server mid-session.
+  const outer = createMockServer({ tools: [{ name: 'x', inputSchema: { type: 'object' } }] })
+  const inner = createMockServer({ tools: [{ name: 'y', inputSchema: { type: 'object' } }] })
+  const mcp = await connect({
+    a: { url: MCP_URL, fetch: outer.fetchFn },
+    a__b: { url: MCP_URL, fetch: inner.fetchFn },
+  })
+  assert.deepEqual(Object.keys(mcp.tools).sort(), ['a__b__y', 'a__x'])
+
+  await mcp.refreshServer('a')
+
+  assert.deepEqual(Object.keys(mcp.tools).sort(), ['a__b__y', 'a__x'])
+  assert.equal(mcp.catalog.length, 2)
   await mcp.close()
 })
 
@@ -605,15 +702,123 @@ test('NodeOAuthProvider: invalidateCredentials drops only the requested scope', 
 })
 
 test('NodeOAuthProvider: refuses a plaintext http server that is not loopback', () => {
-  assert.throws(
-    () =>
-      createNodeOAuthProvider({
-        serverUrl: 'http://mcp.example.test/mcp',
-        redirectUrl: REDIRECT_URL,
-        store: new MemoryOAuthStore(),
-      }),
-    /requires https/,
+  const make = (serverUrl: string) =>
+    createNodeOAuthProvider({ serverUrl, redirectUrl: REDIRECT_URL, store: new MemoryOAuthStore() })
+
+  assert.throws(() => make('http://mcp.example.test/mcp'), /requires https/)
+  // A registrable host that merely STARTS with "localhost" is not loopback —
+  // a prefix match would send bearer tokens to it in cleartext.
+  assert.throws(() => make('http://localhost.attacker.test/mcp'), /requires https/)
+  assert.ok(make('http://localhost:8765/mcp'))
+  assert.ok(make('http://127.0.0.1:8765/mcp'))
+  assert.ok(make('HTTPS://mcp.example.test/mcp'), 'the scheme check is case-insensitive')
+})
+
+test('connectMcpServers: an OAuth server config over plaintext http is refused', async () => {
+  const provider = createNodeOAuthProvider({
+    serverUrl: MCP_URL,
+    redirectUrl: REDIRECT_URL,
+    store: new MemoryOAuthStore(),
+  })
+  // The provider guards its own URL; the transport talks to cfg.url, so a
+  // mismatched pair would still put tokens on the wire in cleartext.
+  const mcp = await connect({
+    docs: { url: 'http://mcp.example.test/mcp', authProvider: provider },
+  })
+  assert.equal(mcp.results[0].connected, false)
+  assert.match(mcp.results[0].error ?? '', /requires https/)
+})
+
+test('NodeOAuthProvider: two tenants of one endpoint do not share credentials', async () => {
+  const store = new MemoryOAuthStore()
+  const a = createNodeOAuthProvider({
+    serverUrl: `${MCP_URL}?tenant=a`,
+    redirectUrl: REDIRECT_URL,
+    store,
+  })
+  const b = createNodeOAuthProvider({
+    serverUrl: `${MCP_URL}?tenant=b`,
+    redirectUrl: REDIRECT_URL,
+    store,
+  })
+  await a.saveTokens({ access_token: 'tenant-a', token_type: 'Bearer' })
+  assert.equal((await a.tokens())?.access_token, 'tenant-a')
+  assert.equal(await b.tokens(), undefined)
+})
+
+test('OAuth: a transient refresh failure still leads to ONE usable authorization', async () => {
+  // auth() silently escalates a failed refresh into a full authorization,
+  // issuing a state + PKCE verifier that the transport's own 401 handling
+  // would then overwrite — leaving the operator with a code the stored pair
+  // cannot verify, on every attempt.
+  const mock = createMockServer({ requireAuth: true })
+  mock.state.failRefresh = true
+  const prompts: URL[] = []
+  const provider = createNodeOAuthProvider({
+    serverUrl: MCP_URL,
+    redirectUrl: REDIRECT_URL,
+    store: new MemoryOAuthStore(),
+    onAuthorizationUrl: (url) => {
+      prompts.push(url)
+    },
+  })
+  await provider.saveClientInformation({ client_id: 'dcr-client-1' })
+  await provider.saveTokens({
+    access_token: 'access-1',
+    token_type: 'Bearer',
+    expires_in: 5, // inside the skew window: the proactive refresh fires first
+    refresh_token: 'refresh-1',
+  })
+  mock.state.validTokens.clear()
+
+  const mcp = await connect({ docs: { url: MCP_URL, authProvider: provider, fetch: mock.fetchFn } })
+  assert.equal(mcp.results[0].needsAuthorization, true)
+  assert.equal(prompts.length, 1, 'the operator was asked exactly once')
+
+  mock.state.failRefresh = false
+  await finishMcpOAuth(
+    provider,
+    { code: 'auth-code-1', state: prompts[0].searchParams.get('state') ?? undefined },
+    { fetch: mock.fetchFn },
   )
+  assert.ok((await provider.tokens())?.access_token, 'the state that reached the user verified')
+})
+
+test('filterTools: allow/deny entries are matched against sanitized names', async () => {
+  const mock = createMockServer({
+    tools: [{ name: 'files.read', inputSchema: { type: 'object' } }],
+  })
+  const logger = collect()
+  const mcp = await connectMcpServers(
+    { 'my.docs': { url: MCP_URL, fetch: mock.fetchFn } },
+    logger.log as never,
+    'agent-test',
+  )
+
+  // The operator configures the name the SERVER advertises; the catalogue
+  // holds the sanitized one. A denylist that stops matching silently hands a
+  // blocked tool back to the model.
+  const denied = filterTools(mcp.tools, mcp.catalog, undefined, ['my.docs__files.read'])
+  assert.deepEqual(Object.keys(denied.tools), [])
+
+  const allowed = filterTools(mcp.tools, mcp.catalog, ['my.docs__files.read'])
+  assert.deepEqual(Object.keys(allowed.tools), ['my_docs__files_read'])
+
+  const missing = collect()
+  filterTools(mcp.tools, mcp.catalog, ['nope__nothing'], undefined, missing.log as never)
+  assert.ok(missing.lines.some((m) => m.includes('matches no discovered tool')))
+  await mcp.close()
+})
+
+test('FileOAuthStore: a file holding a JSON non-object is recovered from, not fatal', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'agent-oauth-'))
+  const file = path.join(dir, 'tokens.json')
+  await writeFile(file, 'null')
+  const store = new FileOAuthStore(file)
+
+  assert.equal(await store.get('k'), undefined)
+  await store.set('k', 'v')
+  assert.equal(await store.get('k'), 'v')
 })
 
 test('FileOAuthStore: round-trips values and keeps the file owner-only', async () => {

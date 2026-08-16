@@ -6,7 +6,7 @@ import type {
 } from '@modelcontextprotocol/sdk/shared/auth.js'
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { randomBytes } from 'node:crypto'
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -32,9 +32,14 @@ const DEFAULT_STORE_PATH = path.join(os.homedir(), '.agent', 'mcp-oauth.json')
 
 /**
  * A JSON file, written 0600 in a 0700 directory (tokens are bearer credentials:
- * anything that can read the file can act as the user). Writes are serialized
- * in-process; concurrent processes sharing one file is not supported - give
- * each its own `filePath`.
+ * anything that can read the file can act as the user). Each write goes through
+ * a temp file + rename, so a reader never sees a half-written store and a crash
+ * cannot lose one.
+ *
+ * Writes are serialized in-process only. Two PROCESSES sharing one file can
+ * still lose an update (both read, both write, the later wins) - the default
+ * path is shared, so give each process its own `filePath` when they authorize
+ * against different servers concurrently.
  */
 export class FileOAuthStore implements IOAuthStore {
   private readonly filePath: string
@@ -46,11 +51,29 @@ export class FileOAuthStore implements IOAuthStore {
 
   private async readAll(): Promise<Record<string, string>> {
     try {
-      return JSON.parse(await readFile(this.filePath, 'utf8')) as Record<string, string>
+      const parsed: unknown = JSON.parse(await readFile(this.filePath, 'utf8'))
+      // Missing, unparseable, or parseable-but-not-an-object (a file holding
+      // `null` would otherwise make every get/set throw forever).
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return {}
+      }
+      return parsed as Record<string, string>
     } catch {
-      // Missing or corrupt: start clean rather than wedging every later call.
       return {}
     }
+  }
+
+  /**
+   * Write via a temp file + rename, which is atomic on POSIX. A plain
+   * `writeFile` truncates first, so a concurrent reader can see an empty file
+   * (and start a whole new authorization), and a crash mid-write loses every
+   * token in the store.
+   */
+  private async writeAll(all: Record<string, string>): Promise<void> {
+    const tmp = `${this.filePath}.${process.pid}.tmp`
+    await writeFile(tmp, JSON.stringify(all, null, 2), { mode: 0o600 })
+    await chmod(tmp, 0o600).catch(() => {})
+    await rename(tmp, this.filePath)
   }
 
   // Serialize read-modify-write so two saves in the same tick can't clobber
@@ -70,10 +93,7 @@ export class FileOAuthStore implements IOAuthStore {
       const all = await this.readAll()
       all[key] = value
       await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 })
-      await writeFile(this.filePath, JSON.stringify(all, null, 2), { mode: 0o600 })
-      // writeFile only applies `mode` when it creates the file; an existing
-      // file keeps whatever permissions it had.
-      await chmod(this.filePath, 0o600).catch(() => {})
+      await this.writeAll(all)
     })
   }
 
@@ -84,8 +104,7 @@ export class FileOAuthStore implements IOAuthStore {
         return
       }
       delete all[key]
-      await writeFile(this.filePath, JSON.stringify(all, null, 2), { mode: 0o600 })
-      await chmod(this.filePath, 0o600).catch(() => {})
+      await this.writeAll(all)
     })
   }
 }
@@ -139,9 +158,34 @@ interface IStoredTokens {
 
 const DEFAULT_SKEW_SECONDS = 30
 
+// origin + path + query: two tenants of one endpoint (?tenant=a vs ?tenant=b)
+// must never share a registration or a token.
 const namespaceFor = (serverUrl: string): string => {
   const u = new URL(serverUrl)
-  return `mcp-oauth:${u.origin}${u.pathname.replace(/\/+$/, '')}`
+  return `mcp-oauth:${u.origin}${u.pathname.replace(/\/+$/, '')}${u.search}`
+}
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+
+/**
+ * OAuth over plaintext hands the bearer token to anyone on the path, so only
+ * https — or a loopback host, where there is no network to sniff — is allowed.
+ * Parsed rather than pattern-matched: `http://localhost.attacker.example/` is a
+ * registrable host that a prefix match would wave through.
+ */
+export const assertSecureOAuthUrl = (url: string, label = 'MCP OAuth'): void => {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    throw new Error(`${label}: "${url}" is not a valid URL`)
+  }
+  if (parsed.protocol === 'https:' || LOOPBACK_HOSTS.has(parsed.hostname)) {
+    return
+  }
+  throw new Error(
+    `${label}: requires https (or a loopback host) - refusing to send tokens to "${url}"`,
+  )
 }
 
 /**
@@ -181,14 +225,7 @@ export class NodeOAuthProvider implements OAuthClientProvider {
       ...opts.clientMetadata,
     } as OAuthClientMetadata
 
-    if (
-      !/^https:/.test(opts.serverUrl) &&
-      !/^http:\/\/(localhost|127\.0\.0\.1)/.test(opts.serverUrl)
-    ) {
-      throw new Error(
-        `MCP OAuth requires https (or a loopback host) - refusing to send tokens to "${opts.serverUrl}"`,
-      )
-    }
+    assertSecureOAuthUrl(opts.serverUrl)
   }
 
   get redirectUrl(): string {

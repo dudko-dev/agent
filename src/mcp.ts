@@ -18,6 +18,7 @@ import path from 'node:path'
 import { URL } from 'node:url'
 import packageJson from '../package.json' with { type: 'json' }
 import { getCurrentRunSandbox } from './context.ts'
+import { assertSecureOAuthUrl } from './mcp-oauth.ts'
 import { ATTR, withSpan } from './tracing.ts'
 import type { IMcpServerConfig } from './types.ts'
 
@@ -59,6 +60,24 @@ const uniqueKey = (base: string, taken: ToolSet): string => {
   return ''
 }
 
+/**
+ * Raised for a tool result carrying `isError`. `toJSON` matters: the AI SDK
+ * puts the thrown value verbatim on the tool-error part, which ends up in
+ * `IStepResult.toolCalls[].output` and therefore in whatever an `IPersistence`
+ * serialises — and `JSON.stringify(new Error('boom'))` is `{}`, losing the one
+ * piece of information the server sent.
+ */
+export class McpToolError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'McpToolError'
+  }
+
+  toJSON(): string {
+    return this.message
+  }
+}
+
 // The subset of the MCP tool descriptor we mount from.
 interface IMcpToolDescriptor {
   name: string
@@ -74,17 +93,68 @@ interface IServerConnect {
   needsAuthorization?: boolean
 }
 
+/** Thrown by the refresh-only view when the SDK reaches for a redirect. */
+class RefreshOnlyAbort extends Error {}
+
+/**
+ * A view of the provider that can renew a token but can never start an
+ * interactive authorization.
+ *
+ * `auth()` has no refresh-only mode: when a refresh fails for a reason it deems
+ * recoverable (a 5xx from the token endpoint, a network blip) it falls straight
+ * through to a brand-new authorization — issuing a state and a PKCE verifier,
+ * overwriting the stored pair, and calling `redirectToAuthorization`. So a
+ * 30-second outage at the authorization server would tell an operator to
+ * re-authorize a session whose refresh token is perfectly good, and the
+ * transport's own `auth()` on the first 401 would then overwrite that state
+ * again, leaving the operator with a code the stored pair cannot verify.
+ * Blocking the three redirect-path methods aborts the escalation before
+ * anything is overwritten.
+ */
+const refreshOnly = (p: OAuthClientProvider): OAuthClientProvider => ({
+  // Must stay truthy: `auth()` reads a missing redirectUrl as "non-interactive
+  // grant" and would try to fetch a token without one.
+  get redirectUrl() {
+    return p.redirectUrl
+  },
+  get clientMetadata() {
+    return p.clientMetadata
+  },
+  clientInformation: () => p.clientInformation(),
+  saveClientInformation: p.saveClientInformation?.bind(p),
+  tokens: () => p.tokens(),
+  saveTokens: (t) => p.saveTokens(t),
+  invalidateCredentials: p.invalidateCredentials?.bind(p),
+  addClientAuthentication: p.addClientAuthentication?.bind(p),
+  validateResourceURL: p.validateResourceURL?.bind(p),
+  codeVerifier: () => p.codeVerifier(),
+  state: () => {
+    throw new RefreshOnlyAbort()
+  },
+  saveCodeVerifier: () => {
+    throw new RefreshOnlyAbort()
+  },
+  redirectToAuthorization: () => {
+    throw new RefreshOnlyAbort()
+  },
+})
+
 /**
  * An access token that is already expired produces a guaranteed 401 on the
  * first request. When the provider can tell us so AND we hold a refresh token,
  * renew before connecting: one round-trip saved, and a run doesn't open with a
- * spurious auth failure. Without a refresh token `auth()` would escalate to an
- * interactive authorization, which is the caller's call to make, not ours.
+ * spurious auth failure.
+ *
+ * Best-effort by design — anything that goes wrong here is left to the
+ * transport's own 401 handling, which is the single owner of asking a human to
+ * authorize again.
  */
 const refreshIfExpired = async (
   provider: OAuthClientProvider,
   serverUrl: string,
-  fetchFn?: FetchLike,
+  fetchFn: FetchLike | undefined,
+  log: (level: 'info' | 'warn' | 'error', message: string) => void,
+  name: string,
 ): Promise<void> => {
   const check = (provider as { isAccessTokenExpired?: () => boolean | Promise<boolean> })
     .isAccessTokenExpired
@@ -98,7 +168,16 @@ const refreshIfExpired = async (
   if (!tokens?.refresh_token) {
     return
   }
-  await auth(provider, { serverUrl, fetchFn })
+  try {
+    await auth(refreshOnly(provider), { serverUrl, fetchFn })
+  } catch (err) {
+    log(
+      'info',
+      err instanceof RefreshOnlyAbort
+        ? `[mcp] ${name}: the stored token could not be refreshed; a new authorization is needed`
+        : `[mcp] ${name}: proactive token refresh failed (${(err as Error).message}); continuing`,
+    )
+  }
 }
 
 export interface IConnectedMcp {
@@ -139,21 +218,29 @@ export const connectMcpServers = async (
   const tools: ToolSet = {}
   const catalog: IConnectedMcp['catalog'] = []
   const results: IConnectedMcp['results'] = []
+  // server name -> the tool keys it currently owns, so a refresh removes
+  // exactly its own entries.
+  const mountedKeys = new Map<string, string[]>()
 
   const mountServerTools = (name: string, client: Client, listed: IMcpToolDescriptor[]): void => {
     const serverPrefix = `${sanitizeName(name)}__`
     // Drop existing entries for this server before re-listing. We mutate in
     // place so external references to `tools` and `catalog` stay valid.
-    for (const k of Object.keys(tools)) {
-      if (k.startsWith(serverPrefix)) {
-        delete tools[k]
-      }
+    //
+    // Delete the keys this server actually mounted, NOT everything sharing its
+    // prefix: sanitizing can make two server names collapse onto one prefix
+    // ("a.b" and "a/b"), and one server's prefix can nest inside another's
+    // ("a" and "a__b"). A prefix sweep would unmount a DIFFERENT server's
+    // tools while leaving its catalogue rows behind.
+    for (const k of mountedKeys.get(name) ?? []) {
+      delete tools[k]
     }
     for (let i = catalog.length - 1; i >= 0; i--) {
       if (catalog[i].server === name) {
         catalog.splice(i, 1)
       }
     }
+    const keys: string[] = []
 
     let mounted = 0
     let skipped = 0
@@ -223,6 +310,14 @@ export const connectMcpServers = async (
               // Caller wanting post-spill redaction can sanitise the file path
               // they receive in the model-facing output - this order favors
               // privacy by default.
+              // An MCP failure is a NORMAL response carrying isError, not a
+              // transport error. It has to end in a throw so the AI SDK records
+              // a failed tool call (ok: false) instead of feeding the error
+              // text to the model as a successful result — which is also what
+              // keeps replanAfter: 'failure' able to see it. Read the flag
+              // before sanitisation, so a sanitizer that throws cannot turn a
+              // failure back into a success.
+              const isError = result.isError === true
               let raw: unknown = result.content
               if (outputSanitizer) {
                 try {
@@ -233,6 +328,9 @@ export const connectMcpServers = async (
                     `[mcp] ${prefixed}: outputSanitizer threw - ${(err as Error).message}; output replaced with placeholder`,
                   )
                   span.setAttribute(ATTR.TOOL_OK, false)
+                  if (isError) {
+                    throw new McpToolError('[output redacted: sanitizer failed]')
+                  }
                   return '[output redacted: sanitizer failed]'
                 }
               }
@@ -241,16 +339,18 @@ export const connectMcpServers = async (
                 // Resolved per-call so concurrent runs spill into their own
                 // per-runId subdirs. undefined when called outside of a run
                 // (defensive; in practice every tool call sits inside runAgentLoop).
-                sandboxDir: getCurrentRunSandbox(),
+                // Failed calls never spill: the files would be orphaned, since
+                // the model only ever sees the thrown message.
+                sandboxDir: isError ? undefined : getCurrentRunSandbox(),
               })
-              // An MCP failure is a NORMAL response carrying isError, not a
-              // transport error. Throw so the AI SDK records a failed tool call
-              // (ok: false) instead of feeding the error text to the model as a
-              // successful result — which also keeps replanAfter: 'failure'
-              // able to see it.
-              if (result.isError) {
+              if (isError) {
                 span.setAttribute(ATTR.TOOL_OK, false)
-                throw new Error(typeof flat === 'string' ? flat : JSON.stringify(flat))
+                const text = typeof flat === 'string' ? flat : JSON.stringify(flat)
+                throw new McpToolError(
+                  text && text !== '[]'
+                    ? text
+                    : `MCP tool "${t.name}" reported an error with no content`,
+                )
               }
               span.setAttribute(ATTR.TOOL_OK, true)
               return flat
@@ -258,8 +358,10 @@ export const connectMcpServers = async (
           ),
       })
       catalog.push({ name: prefixed, description, server: name })
+      keys.push(prefixed)
       mounted++
     }
+    mountedKeys.set(name, keys)
     if (skipped > 0) {
       log('info', `[mcp] ${name}: ${mounted} tools mounted, ${skipped} skipped (length cap)`)
     } else {
@@ -303,7 +405,11 @@ export const connectMcpServers = async (
               `[mcp] ${name}: an explicit Authorization header shadows the OAuth token from authProvider`,
             )
           }
-          await refreshIfExpired(cfg.authProvider, cfg.url, cfg.fetch)
+          // The provider guards its own serverUrl, but the transport talks to
+          // cfg.url — guard that too, or a config pairing an https provider
+          // with an http endpoint posts bearer tokens in cleartext.
+          assertSecureOAuthUrl(cfg.url, `MCP server "${name}"`)
+          await refreshIfExpired(cfg.authProvider, cfg.url, cfg.fetch, log, name)
         }
         transport = new StreamableHTTPClientTransport(new URL(cfg.url), {
           requestInit: headers ? { headers } : undefined,
@@ -554,14 +660,24 @@ export const filterTools = (
   catalog: IConnectedMcp['catalog'],
   available?: string[],
   excluded?: string[],
+  log?: (level: 'info' | 'warn' | 'error', message: string) => void,
 ): { tools: ToolSet; catalog: IConnectedMcp['catalog'] } => {
-  const allow = available?.length ? new Set(available) : null
-  const deny = excluded?.length ? new Set(excluded) : null
+  // Catalogue names are sanitized ("my.docs__files.read" mounts as
+  // "my_docs__files_read"), so raw configured names would silently match
+  // nothing: an allowlist would yield zero tools, and — worse — a denylist
+  // would stop denying. Compare on the sanitized form, and say so when an
+  // entry matches nothing at all.
+  const allow = available?.length ? new Set(available.map(sanitizeName)) : null
+  const deny = excluded?.length ? new Set(excluded.map(sanitizeName)) : null
+  const matched = new Set<string>()
 
   const result: ToolSet = {}
   const filteredCatalog: IConnectedMcp['catalog'] = []
 
   for (const entry of catalog) {
+    if (allow?.has(entry.name) || deny?.has(entry.name)) {
+      matched.add(entry.name)
+    }
     if (allow && !allow.has(entry.name)) {
       continue
     }
@@ -574,6 +690,19 @@ export const filterTools = (
     }
     result[entry.name] = t
     filteredCatalog.push(entry)
+  }
+
+  if (log) {
+    for (const [kind, configured] of [
+      ['availableTools', available],
+      ['excludedTools', excluded],
+    ] as const) {
+      for (const raw of configured ?? []) {
+        if (!matched.has(sanitizeName(raw))) {
+          log('warn', `[mcp] ${kind}: "${raw}" matches no discovered tool`)
+        }
+      }
+    }
   }
   return { tools: result, catalog: filteredCatalog }
 }

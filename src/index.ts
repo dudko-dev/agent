@@ -173,7 +173,7 @@ export const createAgent = async (
       (server) => onToolsChanged?.(server),
       config.inputSanitizer,
     )
-    const f = filterTools(c.tools, c.catalog, config.availableTools, config.excludedTools)
+    const f = filterTools(c.tools, c.catalog, config.availableTools, config.excludedTools, log)
     const merged = mergeNativeTools(f, (name) => {
       // Tear the connection down so we don't leak open MCP transports when
       // the caller's misconfiguration crashes startup.
