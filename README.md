@@ -61,7 +61,7 @@ const agent = await createAgent({
   apiKey: process.env.OPENAI_API_KEY!,
   model: 'gpt-4.1-mini',
   mcpServers: {
-    docs: { url: 'https://mcp.example.com/sse' },
+    docs: { url: 'https://mcp.example.com/mcp' },
   },
   maxIterations: 6,
   maxStepsPerTask: 8,
@@ -161,6 +161,31 @@ await agent.run({ input: 'Got a contact?', history })
 
 Use `getHeaders` on a server config to inject fresh credentials at connect time, then call `agent.reconnect()` after a token rotation. Reconnect refuses while runs are in flight.
 
+`getHeaders` is resolved **once per connect**, so it cannot save a token that expires mid-run — for that, use OAuth.
+
+### MCP over OAuth 2.1
+
+Point `authProvider` at an `OAuthClientProvider` and the SDK discovers the authorization server (RFC 9728), registers this client dynamically when it has no `client_id` yet (RFC 7591), runs PKCE, and — the part a header cannot do — **refreshes the access token on a 401 and retries the request**. `createNodeOAuthProvider` persists tokens and the registration in a `0600` JSON file, so a restarted process picks up where it left off.
+
+```ts
+import { createAgent, createNodeOAuthProvider, finishMcpOAuth } from '@dudko.dev/agent'
+
+const auth = createNodeOAuthProvider({
+  serverUrl: 'https://mcp.example.com/mcp',
+  redirectUrl: 'http://127.0.0.1:8765/callback', // whatever you listen on
+  onAuthorizationUrl: (url) => console.error('Authorize here:', url.href),
+})
+
+const agent = await createAgent({ /* … */ mcpServers: { docs: { url: auth.serverUrl, authProvider: auth } } })
+
+// First run only: the server answers 401, the connect result carries
+// needsAuthorization, and the operator visits the URL above. Feed the code back:
+await finishMcpOAuth(auth, { code, state })
+await agent.reconnect()
+```
+
+Nothing is printed or opened on your behalf; `onAuthorizationUrl` and the loopback listener are yours to wire. `agent.listTools()` stays empty until the flow completes — a server that needs authorization reports `needsAuthorization: true` in its connect result rather than a generic failure. `MCP_SERVERS` (the CLI's env config) is JSON, so it can only express `headers`; OAuth is a library-level feature.
+
 ## Configuration
 
 `createAgent(config)` accepts an [`IAgentConfig`](./src/types.ts). Highlights:
@@ -174,7 +199,7 @@ Use `getHeaders` on a server config to inject fresh credentials at connect time,
 | `model` | Default model for every stage (executor / planner / synthesizer) when no per-stage override is set. |
 | `planner` / `synthesizer` | Optional per-stage override blocks: `{ providerType?, baseURL?, apiKey?, model? }`. Use these to mix providers (e.g. Gemini planner, Anthropic synthesizer). Cross-provider overrides MUST set their own `apiKey`. |
 | `plannerModel` / `synthesizerModel` | **Deprecated** model-only shortcuts. Equivalent to `planner: { model }` / `synthesizer: { model }`. The override block, if present, wins. |
-| `mcpServers` | `Record<name, { url, headers?, getHeaders? } \| { command, args?, env?, cwd? }>` — HTTP/SSE for remote, stdio for locally-spawned servers. |
+| `mcpServers` | `Record<name, { url, headers?, getHeaders?, authProvider?, fetch? } \| { command, args?, env?, cwd? }>` — StreamableHTTP for remote (legacy HTTP+SSE servers are **not** supported), stdio for locally-spawned servers. |
 | `tools` | Optional `ToolSet` of native AI-SDK tools registered alongside MCP-discovered ones. Names must not collide with MCP-prefixed names (`createAgent` throws on conflict). |
 | `availableTools` / `excludedTools` | Whitelist / blacklist applied to **all** tools (MCP and native). |
 | `maxIterations` | Cap on **executed steps** across the run (every step counts, including those run after a `revise`). |
@@ -276,7 +301,9 @@ npm run format:check  # prettier --check
 ## Behavior notes & limitations
 
 - **Module formats.** ESM is the primary target; the CJS build (`dist/index.cjs`) is best-effort and depends on upstream deps (`ai`, `@ai-sdk/*`, `@modelcontextprotocol/sdk`) keeping their CJS fallbacks. If they go pure-ESM, CJS will break — the dual-format guard in [`tests/dist-loadable.test.ts`](./tests/dist-loadable.test.ts) catches the regression on the next build.
-- **MCP connect failures.** By default `createAgent` is fail-tolerant: a server that can't connect is logged at `error` level and skipped. The agent still starts with whatever tools did mount. Set `failOnNoTools: true` to throw when **every** configured server failed.
+- **MCP connect failures.** By default `createAgent` is fail-tolerant: a server that can't connect is logged at `error` level and skipped. The agent still starts with whatever tools did mount. Set `failOnNoTools: true` to throw when **every** configured server failed. Servers connect concurrently, so one slow server no longer delays the ones declared after it; tools still mount in declaration order.
+- **MCP tool errors.** A tool result carrying `isError: true` is surfaced as a **thrown** tool error, so the step records `ok: false` and `replanAfter: 'failure'` sees it. The error text the server returned becomes the error message (after `outputSanitizer`, if you set one).
+- **MCP tool names.** Server and tool names are sanitized into `[a-zA-Z0-9_-]` (what OpenAI, Anthropic and Gemini accept) before being joined as `server__tool`, and a collision produced by that mapping gets a `_2` suffix rather than being dropped. `callTool` always uses the server's original name. If you pin `availableTools` / `excludedTools`, use the sanitized names.
 - **Blocker detection.** When the executor cannot complete a step it ends its reply with the literal `[BLOCKER]` token; the agent strips the token from the surfaced summary and sets `IStepResult.blocked = true`, which triggers the replanner. The detection is structural and language-independent — works regardless of the language the executor wrote in.
 - **Retry duplicates in events.** Executor LLM retries (5xx / 429 / network) restart `streamText`, so consumers may observe `step.text-delta` / `step.tool-call` / `step.tool-result` events repeated for the same step. The `retry` event with `phase: 'execute'` precedes each repeat — UIs should clear any per-step buffers on it.
 - **Mid-stream thought rewrites.** Some providers (notably Gemini structured outputs) rewrite `partialObjectStream.thought` from scratch instead of appending. The agent emits a single `log`-level warning and stops streaming `plan.thought-delta` for that run; the canonical thought still arrives in `plan.created`.
