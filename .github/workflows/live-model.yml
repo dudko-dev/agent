@@ -1,0 +1,135 @@
+name: Live model
+
+# A smoke test against a REAL model, served locally by llama.cpp on the runner.
+# No hosted API and no key: the point is to catch the failures a scripted model
+# cannot show — a provider changing its wire format, a prompt drifting out of
+# what small models can follow, structured output no longer parsing.
+#
+# It gates the release rather than running nightly. A nightly run reports at
+# 3am on yesterday's commit and nobody reads it; the question this answers —
+# "does the agent still work with an actual model?" — matters at the moment
+# something is about to be published. It also runs on dependency PRs, which is
+# where upstream drift actually arrives.
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    # Dependency bumps (including the autoupdate flow's) are the realistic
+    # source of drift; ordinary source PRs are covered by the scripted suite.
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+
+# Pinned so a rerun downloads nothing and behaves the same. Bump deliberately.
+env:
+  LLAMA_TAG: b4785
+  MODEL_REPO: Qwen/Qwen2.5-1.5B-Instruct-GGUF
+  MODEL_FILE: qwen2.5-1.5b-instruct-q4_k_m.gguf
+
+jobs:
+  smoke:
+    name: Real model smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # ADVISORY UNTIL PROVEN, then flip this to false to make it a real gate.
+    #
+    # The evidence for the default model is incomplete: Qwen2.5-1.5B served by
+    # llama-cpp-python's `chatml-function-calling` shim produced no tool calls
+    # at all — not through the agent, and not through a hand-rolled request
+    # with a single trivial tool. That shim is NOT what runs here (llama-server
+    # --jinja uses the model's own template, which does declare tool support),
+    # so the result does not transfer — but it does mean nobody has yet watched
+    # this combination drive a tool end to end.
+    #
+    # Blocking a publish on an unproven assertion is the wrong default. Let it
+    # report for a few releases; if it stays green, make it blocking. If it
+    # stays red, the fix is a larger model (3B+) or a narrower assertion, not
+    # a disabled job.
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache llama.cpp and the model weights
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .live-model
+          key: live-model-${{ env.LLAMA_TAG }}-${{ env.MODEL_FILE }}
+
+      - name: Fetch llama.cpp and the model
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .live-model
+          cd .live-model
+          asset=$(gh api "repos/ggml-org/llama.cpp/releases/tags/$LLAMA_TAG" \
+            --jq '.assets[] | select(.name | test("bin-ubuntu-x64")) | .name' | head -1)
+          echo "::notice::llama.cpp asset $asset"
+          gh release download "$LLAMA_TAG" --repo ggml-org/llama.cpp --pattern "$asset"
+          unzip -q -o "$asset"
+          curl -fsSL -o "$MODEL_FILE" \
+            "https://huggingface.co/$MODEL_REPO/resolve/main/$MODEL_FILE?download=true"
+          ls -la
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Start the model server
+        run: |
+          set -euo pipefail
+          server=$(find .live-model -name llama-server -type f | head -1)
+          chmod +x "$server"
+          # Greedy sampling with a fixed seed: the run has to be reproducible
+          # enough that a failure means the agent broke, not that the model
+          # rolled differently. --jinja turns on the chat template's tool
+          # calling, which is the whole point of the exercise.
+          "$server" -m ".live-model/$MODEL_FILE" \
+            --host 127.0.0.1 --port 8080 \
+            --ctx-size 8192 --temp 0 --seed 42 --jinja --no-warmup \
+            > llama-server.log 2>&1 &
+          for _ in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:8080/health >/dev/null; then
+              echo "model server is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::the model server never became healthy"
+          tail -50 llama-server.log
+          exit 1
+
+      - name: Run the live-model smoke test
+        # One retry: a small model occasionally wanders, and a single stray run
+        # must not block a publish. A second failure is a real signal.
+        run: |
+          set -uo pipefail
+          for attempt in 1 2; do
+            echo "::group::attempt $attempt"
+            if node --test --experimental-strip-types --disable-warning=ExperimentalWarning \
+                 tests/live-model.test.ts; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::attempt $attempt failed"
+          done
+          exit 1
+        env:
+          AGENT_LIVE_MODEL_URL: http://127.0.0.1:8080/v1
+          AGENT_LIVE_MODEL: qwen2.5-1.5b-instruct
+
+      - name: Model server log
+        if: failure()
+        run: tail -100 llama-server.log

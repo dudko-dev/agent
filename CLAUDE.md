@@ -10,6 +10,17 @@
 - `tests/` — `node:test` suites, run via `node --experimental-strip-types`
 - `dist/` — `tsup` build output (do not edit)
 
+## Test layers
+
+- `tests/*.test.ts` — units plus `integration.test.ts`, which runs the whole
+  loop over real sockets against a scripted OpenAI-compatible endpoint, a real
+  MCP server and a real authorization server (`tests/helpers/`). No key, ~5s.
+- `tests/live-model.test.ts` — the same loop against a REAL model. Skipped
+  unless `AGENT_LIVE_MODEL_URL` points at an OpenAI-compatible endpoint; CI
+  starts one via `live-model.yml`. Asserts mechanics only (the loop finished, a
+  tool was driven, arguments parsed) — never wording or plan shape, or the
+  suite becomes a coin flip nobody trusts.
+
 ## Mandatory checks
 
 After **any** change to `.ts` files in `src/` or `tests/`, run:
@@ -50,6 +61,7 @@ This repo follows the unified `autoupdate-with-claude` baseline (same template a
 - `autoupdate.yml` uses `GITHUB_TOKEN` and explicitly dispatches `test.yml` (the `CI` workflow) after PR creation, because events created via `GITHUB_TOKEN` don't trigger `pull_request` workflows.
 - `autoupdate.yml` dispatches `claude.yml` directly via `workflow_dispatch` instead of relying on an `@claude` PR comment.
 - Releases stay wired through `release.yml` (npm Trusted Publisher), which fires via `workflow_run` after a successful CI on `main`. There is no `release-on-version-bump.yml` here — it would conflict with the existing tag/publish chain.
+- `release.yml` now `needs:` the `live-model.yml` workflow: a smoke test against a real model (llama.cpp on the runner, no key) gates the publish. It also runs on PRs that touch `package.json` / `package-lock.json`, which is where dependency drift arrives. Deliberately NOT nightly — a 3am failure on yesterday's commit gets ignored, and the question it answers matters at publish time. `LLAMA_TAG` / `MODEL_*` are pinned so a rerun downloads nothing and behaves the same; bump them on purpose.
 - All actions pinned to the `@v4` line because the runner image currently lacks `externals/node24`, breaking post-cleanup of `@v5/@v6` actions.
 
 Do **not** "fix" any of the above by replacing dispatch calls with comment-based mentions, or by bumping action versions back to `@v5/@v6`.
