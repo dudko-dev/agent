@@ -52,22 +52,33 @@ test(
       )
 
       try {
+        // Two things were measured to arrive at this phrasing.
+        //
+        // The task must be unanswerable without the tool: asked to "echo
+        // hello", the planner takes its answer-directly branch and the run
+        // ends with a plausible sentence and no tool call. Asking for a value
+        // only the server knows removes that shortcut.
+        //
+        // And it must read as a QUESTION, not an order. "Call the secret tool
+        // and report the code" still lost to the answer-directly branch on a
+        // 3B, which then invented a code; "What is the secret code?" matches
+        // the planner's own rule about information the tools can retrieve, and
+        // the tool gets called. Worth knowing: the planner's canned
+        // "Answer the user directly" step is attractive to small models.
         const result = await agent.run({
-          input: 'Use the echo tool to echo the word "hello", then tell me what it returned.',
+          input: 'What is the server-side secret code? Report it exactly.',
         })
 
         assert.ok(result.text.trim().length > 0, 'the run produced a final answer')
         assert.ok(result.plan.steps.length > 0, 'the model produced a parseable plan')
         assert.ok(
-          mcp.calls.some((c) => c.name === 'echo'),
+          mcp.calls.some((c) => c.name === 'secret'),
           `the model drove the MCP tool (calls: ${JSON.stringify(mcp.calls)})`,
         )
-        const echo = mcp.calls.find((c) => c.name === 'echo')
-        assert.equal(
-          typeof (echo?.args as { text?: unknown }).text,
-          'string',
-          'the tool arguments parsed into the declared schema',
-        )
+        // The code could only come down the tool-result path, so this pins the
+        // whole round trip: dispatch, MCP response, and the result reaching the
+        // model's final answer.
+        assert.match(result.text, new RegExp(mcp.secret))
       } finally {
         await agent.close()
       }
