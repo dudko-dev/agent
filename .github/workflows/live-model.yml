@@ -17,9 +17,15 @@ on:
     branches: [main]
     # Dependency bumps (including the autoupdate flow's) are the realistic
     # source of drift; ordinary source PRs are covered by the scripted suite.
+    # The gate's own definition is in the list because the first version of it
+    # shipped broken and could not be exercised until it was already on main
+    # blocking a publish — if you edit the gate, run the gate.
     paths:
       - 'package.json'
       - 'package-lock.json'
+      - '.github/workflows/live-model.yml'
+      - 'tests/live-model.test.ts'
+      - 'tests/helpers/**'
 
 # Pinned so a rerun behaves the same. Bump deliberately.
 #
