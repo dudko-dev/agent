@@ -17,18 +17,36 @@ on:
     branches: [main]
     # Dependency bumps (including the autoupdate flow's) are the realistic
     # source of drift; ordinary source PRs are covered by the scripted suite.
+    # The gate's own definition is in the list because the first version of it
+    # shipped broken and could not be exercised until it was already on main
+    # blocking a publish — if you edit the gate, run the gate.
     paths:
       - 'package.json'
       - 'package-lock.json'
+      - '.github/workflows/live-model.yml'
+      - 'tests/live-model.test.ts'
+      - 'tests/helpers/**'
 
 # Pinned so a rerun behaves the same. Bump deliberately.
 #
-# 3B is the floor, measured rather than guessed: on this exact runtime a
-# Qwen2.5-1.5B never called the tool — it answered from imagination, once
-# reporting a tool's NAME as the secret — while the 3B called it and returned
-# the real value. See the note on the test's phrasing in live-model.test.ts.
+# The server is pinned by DIGEST, not by tag, and that is a scar: the
+# `server-bNNNN` tags stop at b5350 (May 2025) because the project renamed its
+# tags afterwards, so "the newest server-b tag" silently meant a year-old
+# build. That build answers every streamed tool call with
+# `Cannot use tools with stream` — precisely what this agent does — so the job
+# failed and correctly refused to publish. A digest cannot rot into a
+# different meaning the way a naming scheme can. The floating tag is
+# `ghcr.io/ggml-org/llama.cpp:server`; resolve it and paste the digest here.
+#
+# Digest below is b10450.
+#
+# 3B is the floor, measured rather than guessed: on this exact image a
+# Qwen2.5-1.5B never called the tool in three runs (`calls: []`) — it answers
+# from imagination, once reporting a tool's NAME as the secret — while the 3B
+# called it and returned the real value. See the note on the test's phrasing
+# in live-model.test.ts.
 env:
-  LLAMA_IMAGE: ghcr.io/ggml-org/llama.cpp:server-b5350
+  LLAMA_IMAGE: ghcr.io/ggml-org/llama.cpp@sha256:0668d42b64608e32e8d168e7984aabb1557e06e155cfaa268e2b8fa6a55ff841
   MODEL_REPO: Qwen/Qwen2.5-3B-Instruct-GGUF
   MODEL_FILE: qwen2.5-3b-instruct-q4_k_m.gguf
 
@@ -94,6 +112,37 @@ jobs:
           echo "::error::the model server never became healthy"
           docker logs llama | tail -50
           exit 1
+
+      - name: Check the server can stream a tool call
+        # The failure this catches already happened once and cost a release:
+        # an old build served plain chat fine and rejected every streamed tool
+        # call, so the run died deep inside the agent with nothing pointing at
+        # the runtime. One request, asserted directly, turns that into a named
+        # error before the model's judgement is ever involved.
+        run: |
+          set -uo pipefail
+          code=$(curl -s -o /tmp/preflight.json -w '%{http_code}' \
+            http://127.0.0.1:8080/v1/chat/completions \
+            -H 'content-type: application/json' \
+            -d '{
+              "model": "preflight",
+              "stream": true,
+              "messages": [{"role": "user", "content": "Call the ping tool."}],
+              "tools": [{
+                "type": "function",
+                "function": {
+                  "name": "ping",
+                  "description": "ping",
+                  "parameters": {"type": "object", "properties": {}}
+                }
+              }]
+            }')
+          if [ "$code" != "200" ]; then
+            echo "::error::the server rejected a STREAMED tool call (HTTP $code) — the pinned image is too old for what the agent does; bump LLAMA_IMAGE"
+            cat /tmp/preflight.json
+            exit 1
+          fi
+          echo "streamed tool calls are supported"
 
       - name: Run the live-model smoke test
         # One retry: a small model occasionally wanders, and a single stray run
