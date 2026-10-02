@@ -9,6 +9,7 @@ import {
   finishMcpOAuth,
   MemoryOAuthStore,
 } from '../src/mcp-oauth.ts'
+import { isReadOnlyTool } from '../src/approval.ts'
 import { connectMcpServers, filterTools } from '../src/mcp.ts'
 import type { IMcpServerConfig } from '../src/types.ts'
 
@@ -31,8 +32,15 @@ interface RpcMessage {
 
 interface MockOptions {
   requireAuth?: boolean
-  tools?: { name: string; description?: string; inputSchema?: unknown }[]
+  tools?: {
+    name: string
+    description?: string
+    inputSchema?: unknown
+    annotations?: Record<string, unknown>
+  }[]
   failListTools?: boolean
+  /** Paginate tools/list: this many tools per page, cursor = next offset. */
+  pageSize?: number
   /** Awaited before each MCP POST is answered — used to prove overlap. */
   gate?: () => Promise<void>
   onMcpRequest?: () => void
@@ -73,6 +81,8 @@ const createMockServer = (opts: MockOptions = {}) => {
     failRegistration: false,
     /** Set to answer refresh_token grants with a transient 503. */
     failRefresh: false,
+    /** tools/list requests answered, with the cursor each one carried. */
+    listCursors: [] as (string | undefined)[],
   }
 
   const handleRpc = (msg: RpcMessage): unknown => {
@@ -93,6 +103,20 @@ const createMockServer = (opts: MockOptions = {}) => {
     if (msg.method === 'tools/list') {
       if (opts.failListTools) {
         return { jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'list exploded' } }
+      }
+      const cursor = (msg.params as { cursor?: string } | undefined)?.cursor
+      state.listCursors.push(cursor)
+      if (opts.pageSize) {
+        const start = Number(cursor ?? 0)
+        const end = start + opts.pageSize
+        return {
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            tools: tools.slice(start, end),
+            ...(end < tools.length ? { nextCursor: String(end) } : {}),
+          },
+        }
       }
       return { jsonrpc: '2.0', id: msg.id, result: { tools } }
     }
@@ -847,4 +871,90 @@ test('FileOAuthStore: concurrent writes do not clobber each other', async () => 
   for (let i = 0; i < 8; i++) {
     assert.equal(await store.get(`k${i}`), `v${i}`)
   }
+})
+
+// ── pagination / connect timeout / annotations ─────────────────────────────
+
+test('connectMcpServers: follows tools/list pagination, on connect and on refresh', async () => {
+  const tools = Array.from({ length: 7 }, (_, i) => ({
+    name: `t${i}`,
+    inputSchema: { type: 'object' },
+  }))
+  const mock = createMockServer({ tools, pageSize: 3 })
+  const mcp = await connect({ docs: { url: MCP_URL, fetch: mock.fetchFn } })
+  assert.deepEqual(
+    Object.keys(mcp.tools),
+    tools.map((t) => `docs__${t.name}`),
+  )
+  assert.deepEqual(mock.state.listCursors, [undefined, '3', '6'])
+
+  tools.push({ name: 't7', inputSchema: { type: 'object' } })
+  await mcp.refreshServer('docs')
+  assert.equal(Object.keys(mcp.tools).length, 8)
+  assert.deepEqual(mock.state.listCursors.slice(3), [undefined, '3', '6'])
+  await mcp.close()
+})
+
+test('connectMcpServers: a server that never answers times out; the others still mount', async () => {
+  const hanging = createMockServer({ gate: () => new Promise<void>(() => {}) })
+  const healthy = createMockServer()
+  const logger = collect()
+  const started = Date.now()
+  const mcp = await connectMcpServers(
+    {
+      slow: { url: MCP_URL, fetch: hanging.fetchFn },
+      docs: { url: MCP_URL, fetch: healthy.fetchFn },
+    },
+    logger.log as never,
+    'agent-test',
+    undefined,
+    undefined,
+    undefined,
+    { connectTimeoutMs: 150 },
+  )
+  assert.ok(Date.now() - started < 2_000, 'the timeout bounded the connect')
+  assert.deepEqual(mcp.results[0], {
+    name: 'slow',
+    connected: false,
+    error: 'connect timed out after 150ms',
+  })
+  assert.equal(mcp.results[1].connected, true)
+  assert.deepEqual(Object.keys(mcp.tools), ['docs__echo'])
+  assert.ok(logger.lines.some((m) => m.includes('slow: failed to connect - connect timed out')))
+  await mcp.close()
+})
+
+test('connectMcpServers: a per-server connectTimeoutMs wins over the default', async () => {
+  const hanging = createMockServer({ gate: () => new Promise<void>(() => {}) })
+  const mcp = await connectMcpServers(
+    { slow: { url: MCP_URL, fetch: hanging.fetchFn, connectTimeoutMs: 50 } },
+    silent as never,
+    'agent-test',
+    undefined,
+    undefined,
+    undefined,
+    { connectTimeoutMs: 60_000 },
+  )
+  assert.equal(mcp.results[0].error, 'connect timed out after 50ms')
+  await mcp.close()
+})
+
+test('connectMcpServers: annotations.readOnlyHint marks the tool and its catalogue entry', async () => {
+  const mock = createMockServer({
+    tools: [
+      { name: 'get', inputSchema: { type: 'object' }, annotations: { readOnlyHint: true } },
+      { name: 'put', inputSchema: { type: 'object' }, annotations: { destructiveHint: true } },
+    ],
+  })
+  const mcp = await connect({ docs: { url: MCP_URL, fetch: mock.fetchFn } })
+  assert.deepEqual(
+    mcp.catalog.map((c) => [c.name, c.readOnly]),
+    [
+      ['docs__get', true],
+      ['docs__put', false],
+    ],
+  )
+  assert.equal(isReadOnlyTool(mcp.tools.docs__get), true)
+  assert.equal(isReadOnlyTool(mcp.tools.docs__put), false)
+  await mcp.close()
 })

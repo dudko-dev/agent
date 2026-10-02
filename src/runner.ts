@@ -2,25 +2,32 @@ import { randomUUID } from 'node:crypto'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { compactionMaxTokens } from './call-options.ts'
+import { compactHistory, estimateTokens, resolveCompaction, summarizeTrace } from './compaction.ts'
 import { runContext } from './context.ts'
 import { executeStep } from './executor.ts'
-import { createInitialPlan } from './planner.ts'
+import { checkLimits, resolveLimits } from './limits.ts'
+import { createInitialPlan, filterPlanSkills, planStepCap } from './planner.ts'
+import { renderTrace, renderTraceSteps } from './prompts.ts'
 import { decideNextAction } from './replanner.ts'
+import { activateSkill } from './skills.ts'
 import { synthesizeAnswer } from './synthesizer.ts'
-import type { IAgentInternalContext } from './internal.ts'
+import { resolveToolStrategy } from './tool-search.ts'
+import type { EffectiveToolStrategy, IAgentInternalContext, IRunState } from './internal.ts'
 import type {
   AgentEvent,
+  BudgetKind,
   IAgentRunOptions,
   IAgentRunResult,
+  IConversationTurn,
   IPersistence,
   IPlan,
   IRunSnapshot,
   IStepResult,
-  IUsage,
   ReplanTrigger,
 } from './types.ts'
 import { ATTR, withSpan } from './tracing.ts'
-import { combineSignals } from './utils.ts'
+import { accumulateUsage, combineSignals, normalizeUsage } from './utils.ts'
 
 // The default ('failure') replan trigger fires when:
 //   - the executor explicitly signalled a blocker (via the [BLOCKER] sentinel,
@@ -225,6 +232,13 @@ export const runAgentLoop = async (
   })
 }
 
+// The run's effective tool strategy: 'auto' resolved against the live
+// catalogue size, and 'search' only when find_tools is available.
+const runToolStrategy = (ctx: IAgentInternalContext): EffectiveToolStrategy => {
+  const s = resolveToolStrategy(ctx.config, ctx.toolCatalog.length)
+  return s === 'search' && !ctx.findTools ? 'all' : s
+}
+
 const runAgentLoopInner = async (
   ctx: IAgentInternalContext,
   options: IAgentRunOptions,
@@ -237,29 +251,43 @@ const runAgentLoopInner = async (
   // History follows the same rule for symmetry - the original run's history
   // is what shaped the saved trace, so we keep it. Documented in README.
   const input = resumed?.input ?? options.input
-  const history = resumed?.history
+  let history: IConversationTurn[] | undefined = resumed?.history
     ? [...resumed.history]
     : options.history
       ? [...options.history]
       : undefined
   const onEvent = options.onEvent ?? (() => {})
+  const compaction = resolveCompaction(ctx.config.compaction)
+  const limits = resolveLimits(ctx.config)
+  const maxToolCalls = ctx.config.maxToolCalls
 
-  const totalUsage: IUsage = resumed
-    ? { ...resumed.usage }
-    : { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+  // Every IUsage detail is filled (normalizeUsage) so accumulation never
+  // produces NaN on a snapshot written by an older version.
+  const totalUsage = normalizeUsage(resumed?.usage)
   const startedAt = runContext.getStore()?.startedAt ?? Date.now()
   const runId = runContext.getStore()?.runId ?? '<unknown>'
+
+  // Per-run state shared with the stages and (through the run context) with
+  // the tool wrappers.
+  const state: IRunState = {
+    usage: totalUsage,
+    toolCalls: resumed?.toolCallCount ?? 0,
+    strategy: runToolStrategy(ctx),
+    discovered: [],
+    activeSkills: [...(resumed?.activeSkills ?? [])],
+    traceSummary: resumed?.traceSummary,
+    traceSummaryUpTo: resumed?.traceSummaryUpTo ?? 0,
+  }
 
   // proxiedCtx must be in scope BEFORE callPersistence so the persistence
   // error log carries the runId tag (the proxy attaches it; ctx.emit alone
   // does not). Order of declaration matters here.
   const proxiedCtx: IAgentInternalContext = {
     ...ctx,
+    run: state,
     emit: (event: AgentEvent) => {
       if (event.type === 'usage') {
-        totalUsage.inputTokens += event.usage.inputTokens
-        totalUsage.outputTokens += event.usage.outputTokens
-        totalUsage.totalTokens += event.usage.totalTokens
+        accumulateUsage(totalUsage, event.usage)
       }
       const tagged = { ...event, runId: runContext.getStore()?.runId }
       try {
@@ -269,6 +297,14 @@ const runAgentLoopInner = async (
         ctx.emit(tagged)
       } catch {}
     },
+  }
+  const store = runContext.getStore()
+  if (store) {
+    store.emit = proxiedCtx.emit
+    store.state = state
+  }
+  const activate = (name: string, by: 'plan' | 'tool'): void => {
+    activateSkill(ctx.skills ?? [], name, by, state, proxiedCtx.emit)
   }
 
   // Persistence facade. Hooks may be async; we await so a slow store
@@ -292,6 +328,101 @@ const runAgentLoopInner = async (
         message: `[persistence] ${label} threw: ${(err as Error).message}`,
       })
     }
+  }
+
+  // Automatic history compaction (fresh runs only - a resumed run already
+  // carries the history its trace was built from). The run works on the
+  // compacted copy; the caller's array is never mutated and gets the copy
+  // back as result.compactedHistory.
+  let compactedHistory: IConversationTurn[] | undefined
+  if (!resumed && history?.length && compaction.auto) {
+    const r = await compactHistory(history, ctx.synthesizerModel, {
+      thresholdTokens: compaction.thresholdTokens,
+      keepRecentTurns: compaction.keepRecentTurns,
+      summaryMaxTokens: compactionMaxTokens(ctx.config, compaction.summaryMaxTokens),
+      signal,
+      timeoutMs: ctx.config.llmTimeoutMs,
+      onUsage: (usage) => proxiedCtx.emit({ type: 'usage', phase: 'compact', usage }),
+    })
+    if (r.compacted) {
+      history = r.history
+      compactedHistory = r.history
+      proxiedCtx.emit({
+        type: 'context.compacted',
+        scope: 'history',
+        beforeTokens: r.beforeTokens,
+        afterTokens: r.afterTokens,
+      })
+    }
+  }
+
+  // Automatic trace compaction, before each executor / replanner /
+  // synthesizer call: once the rendered trace crosses the threshold, every
+  // step but the last keepRecentSteps is folded into a running summary.
+  // The trace itself stays intact (result, persistence, events).
+  const maybeCompactTrace = async (trace: IStepResult[]): Promise<void> => {
+    if (!compaction.auto || signal?.aborted) {
+      return
+    }
+    const view = () => ({ summary: state.traceSummary, upTo: state.traceSummaryUpTo })
+    const beforeTokens = estimateTokens(renderTrace(trace, view()))
+    if (beforeTokens <= compaction.thresholdTokens) {
+      return
+    }
+    const upTo = trace.length - compaction.keepRecentSteps
+    const from = state.traceSummary ? state.traceSummaryUpTo : 0
+    if (upTo <= from) {
+      return
+    }
+    const r = await summarizeTrace(
+      trace.slice(from, upTo),
+      state.traceSummary,
+      ctx.synthesizerModel,
+      {
+        summaryMaxTokens: compactionMaxTokens(ctx.config, compaction.summaryMaxTokens),
+        signal,
+        timeoutMs: ctx.config.llmTimeoutMs,
+        render: renderTraceSteps,
+        offset: from,
+      },
+    )
+    if (!r) {
+      return
+    }
+    proxiedCtx.emit({ type: 'usage', phase: 'compact', usage: r.usage })
+    state.traceSummary = r.summary
+    state.traceSummaryUpTo = upTo
+    proxiedCtx.emit({
+      type: 'context.compacted',
+      scope: 'trace',
+      beforeTokens,
+      afterTokens: estimateTokens(renderTrace(trace, view())),
+    })
+  }
+
+  // Run-level budgets: token limits (legacy maxTotalTokens included) and the
+  // tool-call cap. Reported once per run.
+  let budgetReported = false
+  const budgetBreach = (): { kind: BudgetKind; tokens: number; cap: number } | undefined => {
+    const tokens = checkLimits(totalUsage, limits)
+    if (tokens) {
+      return tokens
+    }
+    if (typeof maxToolCalls === 'number' && maxToolCalls > 0 && state.toolCalls >= maxToolCalls) {
+      return { kind: 'tool-calls', tokens: state.toolCalls, cap: maxToolCalls }
+    }
+    return undefined
+  }
+  const reportBudget = (): boolean => {
+    const breach = budgetBreach()
+    if (!breach) {
+      return false
+    }
+    if (!budgetReported) {
+      budgetReported = true
+      proxiedCtx.emit({ type: 'budget.exceeded', ...breach })
+    }
+    return true
   }
 
   let plan: IPlan
@@ -348,6 +479,9 @@ const runAgentLoopInner = async (
       }
     }
     proxiedCtx.emit({ type: 'plan.created', plan })
+    for (const name of plan.skills ?? []) {
+      activate(name, 'plan')
+    }
   }
 
   const trace: IStepResult[] = resumed ? [...resumed.trace] : []
@@ -360,7 +494,6 @@ const runAgentLoopInner = async (
   let iterations = resumed?.iterations ?? 0
   let revisions = resumed?.revisions ?? 0
   const maxRevisions = ctx.config.maxRevisions ?? 2
-  const tokenCap = ctx.config.maxTotalTokens
 
   // Build a complete snapshot for the current loop state. Centralises the
   // 14-field literal that used to be repeated at every persistence call site.
@@ -379,6 +512,11 @@ const runAgentLoopInner = async (
     stepIndex,
     iterations,
     revisions,
+    ...(state.traceSummary
+      ? { traceSummary: state.traceSummary, traceSummaryUpTo: state.traceSummaryUpTo }
+      : {}),
+    ...(state.activeSkills.length ? { activeSkills: [...state.activeSkills] } : {}),
+    ...(state.toolCalls ? { toolCallCount: state.toolCalls } : {}),
     ...extra,
   })
 
@@ -403,8 +541,7 @@ const runAgentLoopInner = async (
     if (stepIndex >= currentPlan.steps.length) {
       break
     }
-    if (tokenCap && totalUsage.totalTokens >= tokenCap) {
-      proxiedCtx.emit({ type: 'budget.exceeded', tokens: totalUsage.totalTokens, cap: tokenCap })
+    if (reportBudget()) {
       break
     }
     // Increment AFTER the early-break checks so iterations counts only
@@ -413,6 +550,9 @@ const runAgentLoopInner = async (
     iterations++
 
     const step = currentPlan.steps[stepIndex]
+    if (store) {
+      store.currentStep = step
+    }
     proxiedCtx.emit({ type: 'step.start', step, index: stepIndex })
 
     // Per-step abort: separate from the run-level signal so the user can
@@ -436,6 +576,7 @@ const runAgentLoopInner = async (
 
     let result: IStepResult
     try {
+      await maybeCompactTrace(trace)
       result = await executeStep(input, currentPlan, step, trace, history, proxiedCtx, stepSignal)
     } catch (err) {
       // Distinguish run-level abort (propagate) from step-level abort
@@ -483,6 +624,13 @@ const runAgentLoopInner = async (
     // serialized stepIndex / currentPlan reflect a stable next-loop-entry
     // state. See the three persistCheckpoint() calls below.
 
+    // A budget crossed during the step ends execution right here: no
+    // replanner call, straight to synthesis.
+    if (reportBudget()) {
+      stepIndex++
+      break
+    }
+
     const nextStep = currentPlan.steps[stepIndex + 1] ?? null
     const isLastPlannedStep = nextStep === null
 
@@ -523,6 +671,7 @@ const runAgentLoopInner = async (
 
     let decision
     try {
+      await maybeCompactTrace(trace)
       decision = await decideNextAction(input, currentPlan, trace, nextStep, proxiedCtx, signal)
     } catch (err) {
       proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'replan' })
@@ -551,8 +700,11 @@ const runAgentLoopInner = async (
         break
       }
       revisions++
-      currentPlan = decision.newPlan
+      currentPlan = reviseInto(proxiedCtx, decision.newPlan)
       proxiedCtx.emit({ type: 'plan.revised', plan: currentPlan, reason: decision.reason })
+      for (const name of currentPlan.skills ?? []) {
+        activate(name, 'plan')
+      }
       stepIndex = 0
       await persistCheckpoint()
       continue
@@ -563,6 +715,7 @@ const runAgentLoopInner = async (
 
   let text: string
   try {
+    await maybeCompactTrace(trace)
     text = await synthesizeAnswer(input, currentPlan, trace, history, proxiedCtx, signal)
   } catch (err) {
     proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'synthesize' })
@@ -584,7 +737,30 @@ const runAgentLoopInner = async (
     }),
   )
 
-  return { text, plan: currentPlan, trace, iterations, usage: totalUsage }
+  return {
+    text,
+    plan: currentPlan,
+    trace,
+    iterations,
+    usage: totalUsage,
+    ...(compactedHistory ? { compactedHistory } : {}),
+  }
+}
+
+// A revised plan follows the planner's rules too: the same step cap and
+// only configured skills.
+const reviseInto = (ctx: IAgentInternalContext, plan: IPlan): IPlan => {
+  const cap = planStepCap(ctx)
+  if (plan.steps.length > cap) {
+    ctx.emit({
+      type: 'log',
+      level: 'warn',
+      message: `[replan] revised plan has ${plan.steps.length} steps; truncated to hard cap ${cap}`,
+    })
+  }
+  const skills = filterPlanSkills(ctx, plan.skills)
+  const { skills: _drop, ...rest } = plan
+  return { ...rest, steps: plan.steps.slice(0, cap), ...(skills ? { skills } : {}) }
 }
 
 const asError = (err: unknown): Error =>

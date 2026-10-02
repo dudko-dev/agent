@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import type { IRunState } from './internal.ts'
+import type { EventHandler, IPlanStep } from './types.ts'
 
 export interface IRunContext {
   runId: string
@@ -7,6 +9,15 @@ export interface IRunContext {
   // first tool that needs to spill binary content; consumers can probe it
   // via getCurrentRunSandbox() and write into it directly.
   sandboxDir: string
+  // The run's event sink (tags runId, accumulates usage). Set by the runner
+  // once the run starts; tool wrappers (approval gate, find_tools, skills,
+  // subagents) emit through it so their events land in the right run.
+  emit?: EventHandler
+  // The plan step currently executing, for events emitted from inside tools.
+  currentStep?: IPlanStep
+  // Mutable per-run state shared with the tool wrappers (usage, tool-call
+  // count, discovered tools, active skills).
+  state?: IRunState
 }
 
 // Per-run context. Propagates through awaits, so any code reachable from

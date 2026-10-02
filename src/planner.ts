@@ -1,15 +1,17 @@
 import { streamObject } from 'ai'
 import { z } from 'zod'
-import type { IAgentInternalContext } from './internal.ts'
+import { stageCallOptions } from './call-options.ts'
+import type { EffectiveToolStrategy, IAgentInternalContext } from './internal.ts'
 import {
-  buildPlannerSystem,
+  DEFAULT_PLAN_STEP_CAP,
   buildPlannerUserPrompt,
-  withDomainContext,
-  type CatalogMode,
+  composePlannerSystem,
+  type PromptCatalogMode,
 } from './prompts.ts'
+import { resolveToolStrategy } from './tool-search.ts'
 import { ATTR, withSpan } from './tracing.ts'
 import type { IConversationTurn, IPlan, IUsage } from './types.ts'
-import { withRetry, withTimeout } from './utils.ts'
+import { normalizeUsage, withRetry, withTimeout } from './utils.ts'
 
 export const PlanStepSchema = z.object({
   id: z.string().min(1).describe('Short stable id, e.g. "s1", "fetch-companies"'),
@@ -23,13 +25,59 @@ export const PlanStepSchema = z.object({
 
 // NOTE: no .max() on steps — Anthropic's native structured output
 // (output_config.format.schema) rejects `maxItems` on array types. The cap
-// is enforced via the planner prompt ("hard cap is 8") and a slice() below.
-export const PLAN_STEP_HARD_CAP = 8
+// is enforced via the planner prompt ("hard cap is N") and a slice() below.
+// Configurable per agent with `maxPlanSteps`.
+export const PLAN_STEP_HARD_CAP = DEFAULT_PLAN_STEP_CAP
 
 export const PlanSchema = z.object({
   thought: z.string().min(1).describe('One-paragraph reasoning about how to approach the request'),
   steps: z.array(PlanStepSchema).min(1),
+  // No .max() either (same Anthropic constraint).
+  skills: z
+    .array(z.string())
+    .optional()
+    .describe('Names of skills from the SKILLS list that apply to this request'),
 })
+
+// The effective plan-step cap of an agent.
+export const planStepCap = (ctx: IAgentInternalContext): number => {
+  const v = ctx.config.maxPlanSteps
+  return typeof v === 'number' && Number.isFinite(v) && v >= 1 ? Math.floor(v) : PLAN_STEP_HARD_CAP
+}
+
+// The run's effective tool strategy (set by the runner), or resolved from
+// the config for direct callers.
+export const effectiveToolStrategy = (ctx: IAgentInternalContext): EffectiveToolStrategy => {
+  if (ctx.run) {
+    return ctx.run.strategy
+  }
+  const s = resolveToolStrategy(ctx.config, ctx.toolCatalog.length)
+  return s === 'search' && !ctx.findTools ? 'all' : s
+}
+
+export const catalogModeFor = (strategy: EffectiveToolStrategy): PromptCatalogMode =>
+  strategy === 'plan-narrowed' ? 'compact' : strategy === 'search' ? 'search' : 'full'
+
+// Keep only configured skill names (deduplicated); report the rest.
+export const filterPlanSkills = (
+  ctx: IAgentInternalContext,
+  names: string[] | undefined,
+): string[] | undefined => {
+  if (!names?.length) {
+    return undefined
+  }
+  const known = new Set((ctx.skills ?? []).map((s) => s.name))
+  const kept = [...new Set(names.filter((n) => known.has(n)))]
+  const dropped = names.filter((n) => !known.has(n))
+  if (dropped.length) {
+    ctx.emit({
+      type: 'log',
+      level: 'warn',
+      message: `[plan] dropped unknown skills: ${dropped.join(', ')}`,
+    })
+  }
+  return kept.length ? kept : undefined
+}
 
 export const createInitialPlan = async (
   input: string,
@@ -39,8 +87,8 @@ export const createInitialPlan = async (
 ): Promise<IPlan> =>
   withSpan('agent.plan', { [ATTR.PHASE]: 'plan' }, async (span) => {
     const validNames = new Set(ctx.toolCatalog.map((t) => t.name))
-    const catalogMode: CatalogMode =
-      ctx.config.toolSelectionStrategy === 'plan-narrowed' ? 'compact' : 'full'
+    const catalogMode = catalogModeFor(effectiveToolStrategy(ctx))
+    const cap = planStepCap(ctx)
 
     const { object, usage } = await withRetry(
       () => streamPlanOnce(input, history, catalogMode, ctx, signal),
@@ -55,17 +103,19 @@ export const createInitialPlan = async (
     ctx.emit({ type: 'usage', phase: 'plan', usage })
     span.setAttribute(ATTR.USAGE_TOTAL_TOKENS, usage.totalTokens)
 
-    const cappedSteps = object.steps.slice(0, PLAN_STEP_HARD_CAP)
+    const cappedSteps = object.steps.slice(0, cap)
     if (cappedSteps.length < object.steps.length) {
       ctx.emit({
         type: 'log',
         level: 'warn',
-        message: `[plan] model returned ${object.steps.length} steps; truncated to hard cap ${PLAN_STEP_HARD_CAP}`,
+        message: `[plan] model returned ${object.steps.length} steps; truncated to hard cap ${cap}`,
       })
     }
+    const skills = filterPlanSkills(ctx, object.skills)
 
     return {
       thought: object.thought,
+      ...(skills ? { skills } : {}),
       steps: cappedSteps.map((s) => {
         if (!s.suggestedTools?.length) {
           return s
@@ -98,15 +148,26 @@ export const createInitialPlan = async (
 const streamPlanOnce = async (
   input: string,
   history: IConversationTurn[] | undefined,
-  catalogMode: CatalogMode,
+  catalogMode: PromptCatalogMode,
   ctx: IAgentInternalContext,
   signal?: AbortSignal,
 ): Promise<{ object: z.infer<typeof PlanSchema>; usage: IUsage }> => {
+  const call = stageCallOptions(
+    ctx.config,
+    'planner',
+    composePlannerSystem({
+      mode: catalogMode,
+      catalog: ctx.toolCatalog,
+      maxSteps: planStepCap(ctx),
+      domain: ctx.config.systemPrompt,
+      skills: ctx.skills,
+    }),
+  )
   const result = streamObject({
     model: ctx.plannerModel,
     schema: PlanSchema,
-    system: withDomainContext(buildPlannerSystem(catalogMode), ctx.config.systemPrompt),
-    prompt: buildPlannerUserPrompt(input, ctx.toolCatalog, history, catalogMode),
+    ...call,
+    prompt: buildPlannerUserPrompt(input, history),
     abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
   })
 
@@ -168,12 +229,5 @@ const streamPlanOnce = async (
     }
   }
   const [object, rawUsage] = await Promise.all([result.object, result.usage])
-  return {
-    object,
-    usage: {
-      inputTokens: rawUsage.inputTokens ?? 0,
-      outputTokens: rawUsage.outputTokens ?? 0,
-      totalTokens: rawUsage.totalTokens ?? 0,
-    },
-  }
+  return { object, usage: normalizeUsage(rawUsage) }
 }

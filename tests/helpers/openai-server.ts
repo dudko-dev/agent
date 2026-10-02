@@ -24,6 +24,10 @@ export interface IScriptedReply {
   text?: string
   /** Tool calls to emit instead of text. */
   toolCalls?: { name: string; args: unknown }[]
+  /** Streamed first as `reasoning_content` deltas (the model's thoughts). */
+  reasoning?: string
+  /** Usage to report instead of the default 10 in / 5 out. */
+  usage?: { prompt?: number; completion?: number; cached?: number; reasoning?: number }
 }
 
 export type Script = (request: IChatRequest) => IScriptedReply
@@ -42,13 +46,38 @@ const CHUNK_HEAD = {
   model: 'scripted',
 }
 
-const USAGE = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }
+const usageOf = (reply: IScriptedReply) => {
+  const prompt = reply.usage?.prompt ?? 10
+  const completion = reply.usage?.completion ?? 5
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    ...(reply.usage?.cached !== undefined
+      ? { prompt_tokens_details: { cached_tokens: reply.usage.cached } }
+      : {}),
+    ...(reply.usage?.reasoning !== undefined
+      ? { completion_tokens_details: { reasoning_tokens: reply.usage.reasoning } }
+      : {}),
+  }
+}
 
 const sse = (payload: unknown): string => `data: ${JSON.stringify(payload)}\n\n`
 
 const streamBody = (reply: IScriptedReply): string => {
   const parts: string[] = []
   parts.push(sse({ ...CHUNK_HEAD, choices: [{ index: 0, delta: { role: 'assistant' } }] }))
+  if (reply.reasoning) {
+    const size = Math.max(1, Math.ceil(reply.reasoning.length / 2))
+    for (let i = 0; i < reply.reasoning.length; i += size) {
+      parts.push(
+        sse({
+          ...CHUNK_HEAD,
+          choices: [{ index: 0, delta: { reasoning_content: reply.reasoning.slice(i, i + size) } }],
+        }),
+      )
+    }
+  }
 
   if (reply.toolCalls?.length) {
     reply.toolCalls.forEach((call, index) => {
@@ -106,7 +135,7 @@ const streamBody = (reply: IScriptedReply): string => {
     parts.push(sse({ ...CHUNK_HEAD, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }))
   }
 
-  parts.push(sse({ ...CHUNK_HEAD, choices: [], usage: USAGE }))
+  parts.push(sse({ ...CHUNK_HEAD, choices: [], usage: usageOf(reply) }))
   parts.push('data: [DONE]\n\n')
   return parts.join('')
 }
@@ -134,7 +163,7 @@ const jsonBody = (reply: IScriptedReply): string =>
         finish_reason: reply.toolCalls?.length ? 'tool_calls' : 'stop',
       },
     ],
-    usage: USAGE,
+    usage: usageOf(reply),
   })
 
 /** Start the endpoint on an ephemeral port. `script` decides each answer. */
@@ -187,3 +216,25 @@ export const wantsSchema = (req: IChatRequest, name: string): boolean =>
 /** True when the conversation already carries a tool result. */
 export const hasToolResult = (req: IChatRequest): boolean =>
   req.messages.some((m) => m.role === 'tool' || m.tool_call_id !== undefined)
+
+/** The system prompt of a request ('' when none). */
+export const systemOf = (req: IChatRequest): string => {
+  const system = req.messages.find((m) => m.role === 'system')?.content
+  return typeof system === 'string' ? system : JSON.stringify(system ?? '')
+}
+
+/** The (first) user message of a request ('' when none). */
+export const userOf = (req: IChatRequest): string => {
+  const user = req.messages.find((m) => m.role === 'user')?.content
+  return typeof user === 'string' ? user : JSON.stringify(user ?? '')
+}
+
+/** Tool results already in the conversation, oldest first. */
+export const toolResults = (req: IChatRequest): string[] =>
+  req.messages
+    .filter((m) => m.role === 'tool')
+    .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+
+/** Names of the tools offered in a request. */
+export const toolNames = (req: IChatRequest): string[] =>
+  (req.tools ?? []).map((t) => t.function?.name ?? '').filter(Boolean)

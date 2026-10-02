@@ -17,6 +17,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { URL } from 'node:url'
 import packageJson from '../package.json' with { type: 'json' }
+import { markReadOnly } from './approval.ts'
 import { getCurrentRunSandbox } from './context.ts'
 import { assertSecureOAuthUrl } from './mcp-oauth.ts'
 import { ATTR, withSpan } from './tracing.ts'
@@ -83,6 +84,38 @@ interface IMcpToolDescriptor {
   name: string
   description?: string
   inputSchema: unknown
+  annotations?: { readOnlyHint?: boolean }
+}
+
+// Default connect + tools/list budget per server.
+export const DEFAULT_MCP_CONNECT_TIMEOUT_MS = 30_000
+// tools/list pagination cap: a server returning a cursor forever must not
+// hang the connect.
+export const MAX_TOOL_LIST_PAGES = 100
+
+/**
+ * Every tool of a server, following `nextCursor` (up to MAX_TOOL_LIST_PAGES
+ * pages; a repeated cursor ends the walk).
+ */
+export const listAllTools = async (
+  client: Pick<Client, 'listTools'>,
+  onTruncated?: () => void,
+): Promise<IMcpToolDescriptor[]> => {
+  const all: IMcpToolDescriptor[] = []
+  let cursor: string | undefined
+  const seen = new Set<string>()
+  for (let page = 0; page < MAX_TOOL_LIST_PAGES; page++) {
+    const r = await client.listTools(cursor ? { cursor } : undefined)
+    all.push(...(r.tools as IMcpToolDescriptor[]))
+    const next = typeof r.nextCursor === 'string' && r.nextCursor ? r.nextCursor : undefined
+    if (!next || seen.has(next)) {
+      return all
+    }
+    seen.add(next)
+    cursor = next
+  }
+  onTruncated?.()
+  return all
 }
 
 interface IServerConnect {
@@ -186,7 +219,7 @@ export interface IConnectedMcp {
   // in place. Callers should always read through these references rather than
   // caching their own snapshot.
   tools: ToolSet
-  catalog: { name: string; description: string; server: string }[]
+  catalog: { name: string; description: string; server: string; readOnly?: boolean }[]
   close: () => Promise<void>
   // Per-server connect outcome so the caller can decide whether to fail hard
   // (e.g. when every configured server failed and the agent would otherwise
@@ -213,6 +246,11 @@ export const connectMcpServers = async (
   // already sanitized them for event emission - idempotency is documented
   // and required).
   inputSanitizer?: (toolName: string, input: unknown) => unknown | Promise<unknown>,
+  options: {
+    // Default per-server connect + tools/list budget (a server's own
+    // connectTimeoutMs wins). Default 30_000; 0 disables.
+    connectTimeoutMs?: number
+  } = {},
 ): Promise<IConnectedMcp> => {
   const clients = new Map<string, Client>()
   const tools: ToolSet = {}
@@ -267,6 +305,7 @@ export const connectMcpServers = async (
         )
       }
       const description = t.description ?? ''
+      const readOnly = t.annotations?.readOnlyHint === true
       tools[prefixed] = dynamicTool({
         description,
         inputSchema: jsonSchema(t.inputSchema as Parameters<typeof jsonSchema>[0]),
@@ -357,7 +396,10 @@ export const connectMcpServers = async (
             },
           ),
       })
-      catalog.push({ name: prefixed, description, server: name })
+      if (readOnly) {
+        markReadOnly(tools[prefixed])
+      }
+      catalog.push({ name: prefixed, description, server: name, readOnly })
       keys.push(prefixed)
       mounted++
     }
@@ -369,12 +411,76 @@ export const connectMcpServers = async (
     }
   }
 
+  const listServerTools = (name: string, client: Client): Promise<IMcpToolDescriptor[]> =>
+    listAllTools(client, () =>
+      log(
+        'warn',
+        `[mcp] ${name}: tools/list still paginating after ${MAX_TOOL_LIST_PAGES} pages; the rest is ignored`,
+      ),
+    )
+
   const registerServerTools = async (name: string, client: Client): Promise<void> => {
-    mountServerTools(name, client, (await client.listTools()).tools as IMcpToolDescriptor[])
+    mountServerTools(name, client, await listServerTools(name, client))
   }
 
   const openConnection = async (name: string, cfg: IMcpServerConfig): Promise<IServerConnect> => {
+    const configured = cfg.connectTimeoutMs ?? options.connectTimeoutMs
+    const timeoutMs =
+      typeof configured === 'number' && Number.isFinite(configured) && configured >= 0
+        ? configured
+        : DEFAULT_MCP_CONNECT_TIMEOUT_MS
+    // `client` is shared with the watchdog below: a connect that times out
+    // closes whatever client it got as far as creating, and an attempt that
+    // completes AFTER the timeout closes its own client instead of mounting.
     let client: Client | undefined
+    let timedOut = false
+    const attempt = connectOnce(
+      name,
+      cfg,
+      (c) => {
+        client = c
+      },
+      () => timedOut,
+    )
+    try {
+      return await (timeoutMs > 0
+        ? withConnectTimeout(attempt, timeoutMs, () => {
+            timedOut = true
+          })
+        : attempt)
+    } catch (err) {
+      // The client may be live even though we ended up here (listTools failing
+      // after a successful connect, or the watchdog firing). Close it, or the
+      // transport - an SSE stream or a spawned child process - outlives the
+      // failed connect.
+      if (client) {
+        await (client as Client).close().catch(() => {})
+      }
+      const message = timedOut ? `connect timed out after ${timeoutMs}ms` : (err as Error).message
+      const needsAuthorization = !timedOut && err instanceof UnauthorizedError
+      log(
+        'error',
+        needsAuthorization
+          ? `[mcp] ${name}: authorization required - complete the OAuth flow and reconnect`
+          : `[mcp] ${name}: failed to connect - ${message}`,
+      )
+      return { name, error: message, needsAuthorization }
+    }
+  }
+
+  const connectOnce = async (
+    name: string,
+    cfg: IMcpServerConfig,
+    onClient: (client: Client) => void,
+    isTimedOut: () => boolean,
+  ): Promise<IServerConnect> => {
+    let client: Client | undefined
+    const bail = async (): Promise<void> => {
+      if (isTimedOut()) {
+        await client?.close().catch(() => {})
+        throw new Error('connect timed out')
+      }
+    }
     try {
       let transport: Transport
       if (isStdioConfig(cfg)) {
@@ -435,8 +541,11 @@ export const connectMcpServers = async (
       transport.onerror = (err) => log('warn', `[mcp] ${name}: transport error - ${err.message}`)
       transport.onclose = () => log('warn', `[mcp] ${name}: transport closed`)
 
+      await bail()
       client = new Client({ name: clientName, version: CLIENT_VERSION })
+      onClient(client)
       await client.connect(transport)
+      await bail()
 
       // Subscribe BEFORE the first list call: a server that mutates its tool
       // set during init would otherwise lose the notification in the small
@@ -447,23 +556,14 @@ export const connectMcpServers = async (
         })
       }
 
-      return { name, client, listed: (await client.listTools()).tools as IMcpToolDescriptor[] }
+      const listed = await listServerTools(name, client)
+      await bail()
+      return { name, client, listed }
     } catch (err) {
-      // The client may be live even though we ended up here (listTools failing
-      // after a successful connect). Close it, or the transport - an SSE stream
-      // or a spawned child process - outlives the failed connect.
       if (client) {
         await client.close().catch(() => {})
       }
-      const message = (err as Error).message
-      const needsAuthorization = err instanceof UnauthorizedError
-      log(
-        'error',
-        needsAuthorization
-          ? `[mcp] ${name}: authorization required - complete the OAuth flow and reconnect`
-          : `[mcp] ${name}: failed to connect - ${message}`,
-      )
-      return { name, error: message, needsAuthorization }
+      throw err
     }
   }
 
@@ -505,6 +605,31 @@ export const connectMcpServers = async (
     },
   }
 }
+
+// Race a connect attempt against a watchdog. The attempt keeps running in
+// the background after a timeout (its own checks close the client), so its
+// eventual rejection is swallowed here.
+const withConnectTimeout = <T>(
+  attempt: Promise<T>,
+  timeoutMs: number,
+  onTimeout: () => void,
+): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      onTimeout()
+      reject(new Error(`connect timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    attempt.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (err: unknown) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
 
 // Map common MCP mimeTypes to file extensions. Falls back to a generic
 // extension keyed by the part kind so the file at least carries a hint for

@@ -1,9 +1,14 @@
 import type {
   IAgentConfig,
   IAgentStageOverride,
+  ICompactionConfig,
   IMcpServerConfig,
+  ITokenLimits,
   LogLevel,
   ProviderType,
+  ThinkingLevel,
+  ThinkingSetting,
+  ToolApprovalMode,
 } from '../index.ts'
 
 const PROVIDERS: readonly ProviderType[] = [
@@ -24,7 +29,22 @@ const REQUIRES_BASE_URL: ReadonlySet<ProviderType> = new Set<ProviderType>([
   'azure',
 ])
 const LOG_LEVELS: readonly LogLevel[] = ['none', 'error', 'warn', 'info', 'debug']
-const TOOL_STRATEGIES = ['all', 'plan-narrowed'] as const
+const TOOL_STRATEGIES = ['all', 'plan-narrowed', 'search', 'auto'] as const
+const THINKING_LEVELS: readonly ThinkingLevel[] = [
+  'provider-default',
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+]
+const APPROVAL_MODES: readonly ToolApprovalMode[] = [
+  'autopilot',
+  'ask-writes',
+  'ask-all',
+  'read-only',
+]
 type ToolStrategy = (typeof TOOL_STRATEGIES)[number]
 
 export const loadConfig = (): IAgentConfig => {
@@ -66,12 +86,98 @@ export const loadConfig = (): IAgentConfig => {
     maxStepsPerTask: parsePositiveInt(process.env.AGENT_MAX_STEPS_PER_TASK, 8),
     maxRevisions: parseOptionalInt(process.env.AGENT_MAX_REVISIONS),
     maxTotalTokens: parseOptionalInt(process.env.AGENT_MAX_TOTAL_TOKENS),
+    limits: parseLimits(),
+    maxToolCalls: parseOptionalInt(process.env.AGENT_MAX_TOOL_CALLS),
+    thinking: parseThinking(process.env.AGENT_THINKING),
+    toolApproval: parseApproval(process.env.AGENT_TOOL_APPROVAL),
+    compaction: parseCompaction(),
     llmTimeoutMs: parseOptionalInt(process.env.AGENT_LLM_TIMEOUT_MS),
     llmMaxRetries: parseOptionalInt(process.env.AGENT_LLM_MAX_RETRIES),
     toolSelectionStrategy: parseToolStrategy(process.env.AGENT_TOOL_SELECTION_STRATEGY),
     logLevel,
   }
 }
+
+// AGENT_THINKING: off | provider-default | none | minimal | low | medium |
+// high | xhigh | <number> (an exact budget in tokens, level 'medium').
+// 'off' disables thinking explicitly (reasoning: 'none'); unset leaves the
+// provider default.
+export const parseThinking = (raw: string | undefined): ThinkingSetting | undefined => {
+  const v = raw?.trim().toLowerCase()
+  if (!v) {
+    return undefined
+  }
+  if (v === 'off') {
+    return 'none'
+  }
+  if (THINKING_LEVELS.includes(v as ThinkingLevel)) {
+    return v as ThinkingLevel
+  }
+  const n = Number(v)
+  if (Number.isFinite(n) && n > 0) {
+    return { level: 'medium', budgetTokens: Math.floor(n) }
+  }
+  throw new Error(
+    `AGENT_THINKING must be off | ${THINKING_LEVELS.join(' | ')} | <budget tokens>, got: ${raw}`,
+  )
+}
+
+// AGENT_MAX_INPUT_TOKENS / AGENT_MAX_OUTPUT_TOKENS / AGENT_MAX_REASONING_TOKENS.
+// (AGENT_MAX_TOTAL_TOKENS keeps feeding the legacy top-level maxTotalTokens.)
+const parseLimits = (): ITokenLimits | undefined => {
+  const limits: ITokenLimits = {}
+  const input = parseOptionalInt(process.env.AGENT_MAX_INPUT_TOKENS)
+  const output = parseOptionalInt(process.env.AGENT_MAX_OUTPUT_TOKENS)
+  const reasoning = parseOptionalInt(process.env.AGENT_MAX_REASONING_TOKENS)
+  if (input) {
+    limits.maxInputTokens = input
+  }
+  if (output) {
+    limits.maxOutputTokens = output
+  }
+  if (reasoning) {
+    limits.maxReasoningTokens = reasoning
+  }
+  return Object.keys(limits).length ? limits : undefined
+}
+
+const parseApproval = (raw: string | undefined): { mode: ToolApprovalMode } | undefined => {
+  const v = raw?.trim()
+  if (!v) {
+    return undefined
+  }
+  if (!APPROVAL_MODES.includes(v as ToolApprovalMode)) {
+    throw new Error(`AGENT_TOOL_APPROVAL must be ${APPROVAL_MODES.join(' | ')}, got: ${v}`)
+  }
+  return { mode: v as ToolApprovalMode }
+}
+
+// AGENT_COMPACTION=off disables automatic compaction (the /compact command
+// still works); AGENT_CONTEXT_WINDOW_TOKENS sets the window the default
+// threshold (50%) is derived from.
+const parseCompaction = (): ICompactionConfig | undefined => {
+  const raw = process.env.AGENT_COMPACTION?.trim().toLowerCase()
+  const window = parseOptionalInt(process.env.AGENT_CONTEXT_WINDOW_TOKENS)
+  const cfg: ICompactionConfig = {}
+  if (raw) {
+    if (['off', 'false', '0', 'no'].includes(raw)) {
+      cfg.auto = false
+    } else if (['on', 'auto', 'true', '1', 'yes'].includes(raw)) {
+      cfg.auto = true
+    } else {
+      throw new Error(`AGENT_COMPACTION must be on | off, got: ${process.env.AGENT_COMPACTION}`)
+    }
+  }
+  if (window) {
+    cfg.contextWindowTokens = window
+  }
+  return Object.keys(cfg).length ? cfg : undefined
+}
+
+// AGENT_SKILLS_DIR: a folder of <skill>/SKILL.md (loaded by the REPL, which
+// is async; loadConfig stays sync).
+export const skillsDirFromEnv = (): string | undefined =>
+  process.env.AGENT_SKILLS_DIR?.trim() || undefined
 
 // Read AGENT_<prefix>_PROVIDER_TYPE / _BASE_URL / _API_KEY / _MODEL into a
 // stage override block. Returns undefined if no field is set so the agent
