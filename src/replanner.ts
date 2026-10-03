@@ -1,11 +1,12 @@
 import { generateObject } from 'ai'
 import { z } from 'zod'
+import { stageCallOptions } from './call-options.ts'
 import type { IAgentInternalContext } from './internal.ts'
-import { PlanSchema } from './planner.ts'
-import { REPLANNER_SYSTEM, buildReplannerUserPrompt, withDomainContext } from './prompts.ts'
+import { PlanSchema, catalogModeFor, effectiveToolStrategy } from './planner.ts'
+import { buildReplannerUserPrompt, composeReplannerSystem } from './prompts.ts'
 import { ATTR, withSpan } from './tracing.ts'
 import type { IPlan, IPlanStep, IStepResult, IUsage } from './types.ts'
-import { withRetry, withTimeout } from './utils.ts'
+import { normalizeUsage, withRetry, withTimeout } from './utils.ts'
 
 export const DecisionSchema = z.discriminatedUnion('mode', [
   z.object({
@@ -34,29 +35,32 @@ export const decideNextAction = async (
   signal?: AbortSignal,
 ): Promise<ReplanDecision> =>
   withSpan('agent.replan', { [ATTR.PHASE]: 'replan' }, async (span) => {
-    const catalogMode = ctx.config.toolSelectionStrategy === 'plan-narrowed' ? 'compact' : 'full'
+    const catalogMode = catalogModeFor(effectiveToolStrategy(ctx))
+    const view = ctx.run
+      ? { summary: ctx.run.traceSummary, upTo: ctx.run.traceSummaryUpTo }
+      : undefined
 
     const { object, usage } = await withRetry(
       async () => {
+        const call = stageCallOptions(
+          ctx.config,
+          'replanner',
+          composeReplannerSystem({
+            mode: catalogMode,
+            catalog: ctx.toolCatalog,
+            domain: ctx.config.systemPrompt,
+            skills: ctx.skills,
+            activeSkills: ctx.run?.activeSkills,
+          }),
+        )
         const r = await generateObject({
           model: ctx.plannerModel,
           schema: DecisionSchema,
-          system: withDomainContext(REPLANNER_SYSTEM, ctx.config.systemPrompt),
-          prompt: buildReplannerUserPrompt(
-            input,
-            plan,
-            trace,
-            nextStep,
-            ctx.toolCatalog,
-            catalogMode,
-          ),
+          ...call,
+          prompt: buildReplannerUserPrompt(input, plan, trace, nextStep, view),
           abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
         })
-        const usage: IUsage = {
-          inputTokens: r.usage.inputTokens ?? 0,
-          outputTokens: r.usage.outputTokens ?? 0,
-          totalTokens: r.usage.totalTokens ?? 0,
-        }
+        const usage: IUsage = normalizeUsage(r.usage)
         return { object: r.object, usage }
       },
       {

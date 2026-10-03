@@ -7,6 +7,17 @@
 ## Layout
 
 - `src/` — library + CLI source (`.ts`, imported with explicit `.ts` extensions)
+  - `agent.ts` (`createAgent`, `IAgent`), `runner.ts` (the loop), `planner.ts` /
+    `executor.ts` / `replanner.ts` / `synthesizer.ts`, `prompts.ts` (system =
+    run-stable, user = dynamic), `call-options.ts` (per-stage SDK options).
+  - Feature modules: `thinking.ts`, `limits.ts`, `compaction.ts`, `skills.ts`,
+    `approval.ts`, `tool-wrap.ts` (approval gate + tool-call budget + output
+    cap, wrapped around every tool's `execute`), `tool-search.ts`,
+    `caching.ts` (system breakpoint + rolling message breakpoint),
+    `context-editing.ts` (stale tool results → stubs inside a step's loop),
+    `subagent.ts` + `subagent-worker.ts` (worker entry, built to
+    `dist/subagent-worker.js`).
+  - `index.ts` is exports only.
 - `tests/` — `node:test` suites, run via `node --experimental-strip-types`
 - `dist/` — `tsup` build output (do not edit)
 
@@ -14,7 +25,10 @@
 
 - `tests/*.test.ts` — units plus `integration.test.ts`, which runs the whole
   loop over real sockets against a scripted OpenAI-compatible endpoint, a real
-  MCP server and a real authorization server (`tests/helpers/`). No key, ~5s.
+  MCP server and a real authorization server (`tests/helpers/`), and
+  `features-integration.test.ts`, which drives thinking, limits, compaction,
+  skills, approval, tool search and subagents (worker + in-process) the same
+  way. No key, ~7s.
 - `tests/live-model.test.ts` — the same loop against a REAL model. Skipped
   unless `AGENT_LIVE_MODEL_URL` points at an OpenAI-compatible endpoint; CI
   starts one via `live-model.yml`. Asserts mechanics only (the loop finished, a
@@ -41,6 +55,9 @@ If `npm install` is needed (e.g. lockfile changed), run it with `--no-audit --no
 - Use `.ts` extensions in relative imports (project relies on `--experimental-strip-types`).
 - Zod v4 is used; when passing heterogeneous schemas through a shared array/iterable, type the collection as `z.ZodType` to avoid union-narrowing errors.
 - Anthropic's native structured output rejects `maxItems` on arrays — never add `.max()` to Zod arrays that flow into structured output. The guard test in `tests/anthropic-schema-compat.test.ts` enforces this.
+- Keep system prompts run-stable (prompt caching): anything that changes per call (history, request, plan, trace) goes in the user prompt. Tests match stages on the role phrases "You are the Planner / Executor / Replanner / Synthesizer" — keep them.
+- Tools reach the run through `runContext` (AsyncLocalStorage): emit, current step and the per-run state. Gate logic belongs inside `execute` (see `tool-wrap.ts`), not in the executor's stream loop.
+- The public API, config fields, event names and semantics are shared with the browser sibling `@dudko.dev/agent-web`; keep names aligned when changing them.
 
 ## Boundaries
 

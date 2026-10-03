@@ -21,7 +21,7 @@ Options:
   --log-level=<level>           AGENT_LOG_LEVEL (none|error|warn|info|debug)
   --max-iterations=<n>          AGENT_MAX_ITERATIONS
   --max-steps-per-task=<n>      AGENT_MAX_STEPS_PER_TASK
-  --tool-strategy=<v>           AGENT_TOOL_SELECTION_STRATEGY (all|plan-narrowed)
+  --tool-strategy=<v>           AGENT_TOOL_SELECTION_STRATEGY (auto|all|plan-narrowed|search)
   -h, --help                    Show this help
 
 API keys are still read from env (AGENT_API_KEY etc.) - we deliberately do
@@ -34,8 +34,26 @@ Required env vars (set directly or via --env-file):
   AGENT_MODEL           model id
   MCP_SERVERS           JSON: { "<name>": { "url": "...", "headers"?: {...} } | { "command": "...", "args"?: [], "env"?: {} } }
 
+Optional env vars (see env.example for the full list):
+  AGENT_THINKING              off | minimal | low | medium | high | xhigh | <budget tokens>
+  AGENT_MAX_INPUT_TOKENS      per-run caps; crossing one jumps to the final answer
+  AGENT_MAX_OUTPUT_TOKENS
+  AGENT_MAX_REASONING_TOKENS
+  AGENT_MAX_TOTAL_TOKENS
+  AGENT_MAX_TOOL_CALLS        cap on tool calls per run
+  AGENT_TOOL_APPROVAL         autopilot | ask-writes | ask-all | read-only
+  AGENT_SKILLS_DIR            folder of <skill>/SKILL.md skills
+  AGENT_CONTEXT_WINDOW_TOKENS model window (auto-compaction threshold = 50%)
+  AGENT_COMPACTION            off disables automatic compaction
+
 Commands inside the REPL:
   /status, /tools, /history, /reset, /reconnect, /exit
+  /compact                    summarise the conversation history now
+  /autopilot                  toggle autopilot (no tool approval prompts)
+  /approval <mode>            autopilot | ask-writes | ask-all | read-only
+
+When the approval mode asks, answer y (allow once), n (deny) or a (always
+allow this tool for the session).
 `
 
 const FLAG_TO_ENV: Record<string, string> = {

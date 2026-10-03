@@ -1,3 +1,5 @@
+import type { IUsage } from './types.ts'
+
 export interface IRetryOptions {
   maxRetries: number
   baseDelayMs?: number
@@ -113,3 +115,69 @@ export const redactHeaders = (
   }
   return out
 }
+
+// A zeroed usage record with every optional detail filled in.
+export const emptyUsage = (): Required<IUsage> => ({
+  inputTokens: 0,
+  outputTokens: 0,
+  totalTokens: 0,
+  reasoningTokens: 0,
+  cachedInputTokens: 0,
+  cacheWriteTokens: 0,
+})
+
+// The subset of the AI SDK's LanguageModelUsage we read. Every field is
+// optional so a provider that reports nothing (or a v6-shaped object) still
+// normalises to zeros instead of NaN.
+export interface ISdkUsageLike {
+  inputTokens?: number
+  outputTokens?: number
+  totalTokens?: number
+  inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number }
+  outputTokenDetails?: { reasoningTokens?: number }
+  // Pre-v6 flat fields, still produced by some wrappers.
+  reasoningTokens?: number
+  cachedInputTokens?: number
+}
+
+const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+
+// AI SDK usage -> IUsage with every detail field filled (0 when unknown).
+export const normalizeUsage = (usage: ISdkUsageLike | undefined | null): Required<IUsage> => {
+  if (!usage) {
+    return emptyUsage()
+  }
+  const inputTokens = n(usage.inputTokens)
+  const outputTokens = n(usage.outputTokens)
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens:
+      typeof usage.totalTokens === 'number' ? usage.totalTokens : inputTokens + outputTokens,
+    reasoningTokens: n(usage.outputTokenDetails?.reasoningTokens ?? usage.reasoningTokens),
+    cachedInputTokens: n(usage.inputTokenDetails?.cacheReadTokens ?? usage.cachedInputTokens),
+    cacheWriteTokens: n(usage.inputTokenDetails?.cacheWriteTokens),
+  }
+}
+
+// a + b, field by field (missing optional fields count as 0).
+export const addUsage = (a: IUsage, b: IUsage): Required<IUsage> => ({
+  inputTokens: a.inputTokens + b.inputTokens,
+  outputTokens: a.outputTokens + b.outputTokens,
+  totalTokens: a.totalTokens + b.totalTokens,
+  reasoningTokens: (a.reasoningTokens ?? 0) + (b.reasoningTokens ?? 0),
+  cachedInputTokens: (a.cachedInputTokens ?? 0) + (b.cachedInputTokens ?? 0),
+  cacheWriteTokens: (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0),
+})
+
+// Add b into a, in place (the run accumulator is shared by reference).
+export const accumulateUsage = (into: IUsage, b: IUsage): void => {
+  Object.assign(into, addUsage(into, b))
+}
+
+// Clip a string to max chars with a "… [truncated N chars]" marker.
+export const clipText = (s: string, max: number): string =>
+  max > 0 && s.length > max ? `${s.slice(0, max)}… [truncated ${s.length - max} chars]` : s
+
+export const errorMessage = (err: unknown): string =>
+  err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err)

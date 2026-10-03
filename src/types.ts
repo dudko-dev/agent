@@ -18,11 +18,170 @@ export type ProviderType =
 export type LogLevel = 'none' | 'error' | 'warn' | 'info' | 'debug'
 
 // 'all'           - executor receives the full filtered ToolSet on every step.
-//                   Best for catalogs <= ~50 tools.
+//                   Best for catalogs <= ~40 tools.
 // 'plan-narrowed' - executor receives only tools listed in step.suggestedTools.
 //                   Planner is required to populate suggestedTools when a step
 //                   needs tools; empty means "reasoning-only step".
-export type ToolSelectionStrategy = 'all' | 'plan-narrowed'
+// 'search'        - executor starts each step with the built-in tools, the
+//                   step's suggestedTools and the tools discovered earlier in
+//                   the run, plus `find_tools`, which searches the whole
+//                   catalogue and activates matches for the rest of the run.
+//                   Built for catalogues of hundreds of tools.
+// 'auto' (default) - 'all' while the filtered catalogue has at most
+//                   `toolSearchThreshold` (default 40) tools, 'search' above.
+export type ToolSelectionStrategy = 'all' | 'plan-narrowed' | 'search' | 'auto'
+
+// The four LLM stages of the loop. The replanner shares the planner's model
+// but has its own thinking / per-call budget knobs.
+export type AgentStage = 'planner' | 'executor' | 'replanner' | 'synthesizer'
+
+// Portable reasoning effort, mapped by the AI SDK onto each provider's own
+// knob. 'none' explicitly disables thinking; 'provider-default' sends the
+// provider's default level.
+export type ThinkingLevel =
+  'provider-default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+
+export interface IThinkingConfig {
+  // Default 'medium'.
+  level?: ThinkingLevel
+  // Exact token budget. Becomes provider-specific options for providers that
+  // take a budget rather than an effort level (Anthropic, Google).
+  budgetTokens?: number
+  // Ask the provider to stream its thoughts (step.reasoning-delta /
+  // final.reasoning-delta) where it supports that. Default true.
+  includeThoughts?: boolean
+}
+
+// false / undefined -> send nothing (provider default); true -> 'medium';
+// a bare level -> { level }.
+export type ThinkingSetting = boolean | ThinkingLevel | IThinkingConfig
+
+// Cumulative per-run token caps. Soft caps: checked between steps and at
+// every executor LLM step boundary; once crossed the run stops executing
+// steps and goes straight to synthesis (which still runs, capped by
+// perCall.synthesizer).
+export interface ITokenLimits {
+  maxInputTokens?: number
+  // Includes reasoning tokens.
+  maxOutputTokens?: number
+  maxReasoningTokens?: number
+  // input + output. Falls back to the legacy top-level `maxTotalTokens`.
+  maxTotalTokens?: number
+  // maxOutputTokens for every single LLM call of a stage.
+  perCall?: {
+    planner?: number
+    executor?: number
+    replanner?: number
+    synthesizer?: number
+    compaction?: number
+  }
+}
+
+export type TokenLimitKind = 'input' | 'output' | 'reasoning' | 'total'
+
+// What a `budget.exceeded` event reports. For 'tool-calls', `tokens` carries
+// the number of tool calls made.
+export type BudgetKind = TokenLimitKind | 'tool-calls'
+
+export interface ILimitBreach {
+  kind: TokenLimitKind
+  tokens: number
+  cap: number
+}
+
+// Context compaction. Everything has a default; pass `{ auto: false }` to
+// keep only the manual `agent.compact()` and the tool-output cap.
+export interface ICompactionConfig {
+  // Compact history (at run start) and trace (before each executor /
+  // replanner / synthesizer call) when their estimate crosses the threshold.
+  // Default true.
+  auto?: boolean
+  // Model context window, in tokens. Default 128_000.
+  contextWindowTokens?: number
+  // Compact when the estimated context exceeds this. Default: 50% of the
+  // window.
+  thresholdTokens?: number
+  // History turns kept verbatim (default 4).
+  keepRecentTurns?: number
+  // Trace steps kept verbatim (default 3).
+  keepRecentSteps?: number
+  // Output cap of a summary call (default 1024).
+  summaryMaxTokens?: number
+  // Per tool result the MODEL sees (default 20_000; 0 = unlimited). The raw
+  // output still lands in the trace and the events.
+  maxToolOutputChars?: number
+  // Inside one step's tool loop: once its context passes this many tokens,
+  // the oldest tool results become one-line stubs (context editing). Default:
+  // a quarter of the window; 0 = never.
+  clearToolResultsAfterTokens?: number
+  // Most recent tool results kept verbatim when clearing (default 3).
+  keepToolResults?: number
+}
+
+// An agentskills.io-style skill: a name + a one-line description shown in an
+// index, and instructions the agent loads only when the skill applies.
+export interface ISkill {
+  // [a-z0-9-]{1,64}
+  name: string
+  // When to use it (shown in the index).
+  description: string
+  // Full instructions (markdown body).
+  content: string
+  // Bundled text resources, skill-relative POSIX paths.
+  files?: { path: string; content: string }[]
+}
+
+// How tool calls are consented:
+//   'autopilot'  - every call runs (default);
+//   'ask-writes' - read-only tools run, anything else asks;
+//   'ask-all'    - every call asks;
+//   'read-only'  - read-only tools run, anything else is denied.
+export type ToolApprovalMode = 'autopilot' | 'ask-writes' | 'ask-all' | 'read-only'
+
+export type ToolPermission = 'allow' | 'ask' | 'deny'
+
+export interface IToolApprovalRequest {
+  // Unique per request.
+  id: string
+  toolName: string
+  // The tool input AFTER inputSanitizer.
+  input: unknown
+  // The tool is known to be read-only (MCP readOnlyHint or markReadOnly).
+  readOnly: boolean
+  step?: IPlanStep
+  runId?: string
+}
+
+// `remember: true` on an approval allows the tool for the rest of this agent
+// instance's life without asking again.
+export type ToolApprovalDecision =
+  boolean | { approved: boolean; reason?: string; remember?: boolean }
+
+export interface IToolApprovalConfig {
+  // Default 'autopilot'. Switch at runtime with agent.setToolApprovalMode().
+  mode?: ToolApprovalMode
+  // Exact tool names or '*' globs, e.g. { 'github__delete_*': 'deny' }.
+  // The most specific match wins (exact > longest glob) and beats the mode.
+  rules?: Record<string, ToolPermission>
+  // Called for every 'ask'. Without it an 'ask' is a denial.
+  onRequest?: (req: IToolApprovalRequest) => ToolApprovalDecision | Promise<ToolApprovalDecision>
+  // No decision within this many ms -> deny. Default: wait forever.
+  timeoutMs?: number
+}
+
+// true (default) / false, or options: Anthropic cache TTL and the OpenAI
+// prompt cache key (default `${clientName}:${stage}`).
+export type PromptCachingSetting = boolean | { ttl?: '5m' | '1h'; key?: string }
+
+// One entry of the tool catalogue (agent.listTools()).
+export interface IToolCatalogEntry {
+  name: string
+  description: string
+  // MCP server name, or '<native>' for config.tools.
+  server?: string
+  // Known to be read-only (MCP annotations.readOnlyHint, or markReadOnly()).
+  readOnly?: boolean
+}
 
 // Remote MCP server reached over StreamableHTTP. (Legacy HTTP+SSE servers -
 // the 2024-11-05 transport with a separate /sse endpoint - are NOT supported;
@@ -44,6 +203,10 @@ export interface IMcpHttpServerConfig {
   // Custom fetch for every HTTP request the transport and the OAuth flow make:
   // corporate proxies, mTLS agents, instrumentation.
   fetch?: FetchLike
+  // A server that does not finish connect + tools/list within this many ms
+  // is reported as failed and closed; the others still mount. Overrides the
+  // top-level mcpConnectTimeoutMs. Default 30_000; 0 disables.
+  connectTimeoutMs?: number
 }
 
 // Local MCP server spawned as a child process. The transport speaks JSON-RPC
@@ -54,6 +217,8 @@ export interface IMcpStdioServerConfig {
   args?: string[]
   env?: Record<string, string>
   cwd?: string
+  // See IMcpHttpServerConfig.connectTimeoutMs.
+  connectTimeoutMs?: number
 }
 
 // Discriminated union: callers pick HTTP or stdio per server. Existing
@@ -139,8 +304,35 @@ export interface IAgentConfig {
   //     predicate can never stall the run.
   replanAfter?: ReplanTrigger
   // Soft cap on cumulative tokens; checked between steps and triggers an
-  // early jump to synthesis when crossed.
+  // early jump to synthesis when crossed. Legacy shortcut for
+  // `limits.maxTotalTokens` (which wins when both are set).
   maxTotalTokens?: number
+  // Cumulative per-run token caps + per-call output caps. See ITokenLimits.
+  limits?: ITokenLimits
+  // Cap on tool calls per run (across steps). Once reached, further calls
+  // fail with "tool-call budget exhausted" and the run goes to synthesis.
+  maxToolCalls?: number
+  // Hard cap on the number of steps in a plan (initial and revised).
+  // Default 8.
+  maxPlanSteps?: number
+  // Thinking / reasoning for every stage. Per-stage entries in stageThinking
+  // win. Compaction calls never think.
+  thinking?: ThinkingSetting
+  stageThinking?: Partial<Record<AgentStage, ThinkingSetting>>
+  // History / trace compaction and the model-visible tool-output cap.
+  compaction?: ICompactionConfig
+  // Skills the planner can pick and the executor can load on demand.
+  skills?: ISkill[]
+  // Tool-call consent. Default: autopilot (every call runs).
+  toolApproval?: IToolApprovalConfig
+  // 'auto' switches to 'search' above this many tools. Default 40.
+  toolSearchThreshold?: number
+  // Default connect + tools/list timeout for every MCP server (each server
+  // can override it). Default 30_000; 0 disables.
+  mcpConnectTimeoutMs?: number
+  // Provider prompt caching. Default true: run-stable system prompts, an
+  // Anthropic cache breakpoint on them, and an OpenAI prompt cache key.
+  promptCaching?: PromptCachingSetting
   llmTimeoutMs?: number
   llmMaxRetries?: number
   // Hard cap on the number of concurrent agent.run() calls a single agent
@@ -194,6 +386,13 @@ export interface IUsage {
   inputTokens: number
   outputTokens: number
   totalTokens: number
+  // Optional in the type for back-compat; the agent always fills them.
+  // Part of outputTokens.
+  reasoningTokens?: number
+  // Input tokens served from the provider's prompt cache (part of inputTokens).
+  cachedInputTokens?: number
+  // Input tokens written to the provider's prompt cache.
+  cacheWriteTokens?: number
 }
 
 export interface IPlanStep {
@@ -212,6 +411,9 @@ export interface IPlanStep {
 export interface IPlan {
   thought: string
   steps: IPlanStep[]
+  // Names of configured skills the planner picked for this request. Their
+  // instructions are injected into the executor / replanner / synthesizer.
+  skills?: string[]
 }
 
 export interface IStepResult {
@@ -230,6 +432,11 @@ export type ReplanTrigger =
 
 export type ReplanCause = 'last-step' | 'clean-step' | 'llm-decision'
 
+// Phase of a `usage` event. 'compact' is a compaction summary call;
+// 'subagent' is usage a subagent tool spent (it counts against this run's
+// limits like any other).
+export type UsagePhase = 'plan' | 'execute' | 'replan' | 'synthesize' | 'compact' | 'subagent'
+
 type AgentEventBody =
   | { type: 'plan.thought-delta'; delta: string }
   // Fires once per planner step as soon as the structured-output stream has
@@ -241,6 +448,8 @@ type AgentEventBody =
   | { type: 'plan.revised'; plan: IPlan; reason: string }
   | { type: 'step.start'; step: IPlanStep; index: number }
   | { type: 'step.text-delta'; step: IPlanStep; delta: string }
+  // The model's thoughts, when thinking is on and the provider streams them.
+  | { type: 'step.reasoning-delta'; step: IPlanStep; delta: string }
   | { type: 'step.tool-call'; step: IPlanStep; name: string; input: unknown }
   | { type: 'step.tool-result'; step: IPlanStep; name: string; output: unknown; ok: boolean }
   | { type: 'step.complete'; step: IPlanStep; result: IStepResult }
@@ -251,16 +460,53 @@ type AgentEventBody =
       cause: ReplanCause
     }
   | { type: 'final.text-delta'; delta: string }
+  | { type: 'final.reasoning-delta'; delta: string }
   | { type: 'final'; text: string }
   | { type: 'log'; level: LogLevel; message: string }
-  | { type: 'usage'; phase: 'plan' | 'execute' | 'replan' | 'synthesize'; usage: IUsage }
+  | { type: 'usage'; phase: UsagePhase; usage: IUsage }
   | {
       type: 'retry'
       phase: 'plan' | 'execute' | 'replan' | 'synthesize'
       attempt: number
       error: string
     }
-  | { type: 'budget.exceeded'; tokens: number; cap: number }
+  // A run-level cap was crossed; the run stops executing steps and
+  // synthesizes. For kind 'tool-calls', `tokens` is the tool-call count.
+  | { type: 'budget.exceeded'; kind: BudgetKind; tokens: number; cap: number }
+  | {
+      type: 'context.compacted'
+      // tool-results = stale results inside a step's tool loop.
+      scope: 'history' | 'trace' | 'tool-results'
+      beforeTokens: number
+      afterTokens: number
+    }
+  | { type: 'skill.activated'; name: string; by: 'plan' | 'tool' }
+  // find_tools found and activated these tools (search strategy).
+  | { type: 'tools.discovered'; step: IPlanStep; query: string; names: string[] }
+  // Only when the agent actually asks (onRequest is called).
+  | {
+      type: 'tool.approval-requested'
+      id: string
+      name: string
+      input: unknown
+      readOnly: boolean
+      step?: IPlanStep
+    }
+  // automatic: true for rule / mode / timeout denials nobody decided on.
+  // Automatic ALLOWs emit nothing, to keep the stream quiet.
+  | {
+      type: 'tool.approval-resolved'
+      id: string
+      name: string
+      approved: boolean
+      reason?: string
+      automatic: boolean
+    }
+  | { type: 'subagent.start'; id: string; name: string; task: string }
+  // A child event, forwarded verbatim (long strings clipped).
+  | { type: 'subagent.event'; id: string; name: string; event: AgentEvent }
+  | { type: 'subagent.complete'; id: string; name: string; text: string; usage: IUsage }
+  | { type: 'subagent.error'; id: string; name: string; error: string }
   | { type: 'revisions.exceeded'; cap: number }
   | { type: 'error'; error: Error; phase: 'plan' | 'execute' | 'replan' | 'synthesize' | 'init' }
 
@@ -304,6 +550,9 @@ export interface IAgentRunResult {
   trace: IStepResult[]
   iterations: number
   usage: IUsage
+  // Set when the run compacted the history it was given (the caller's array
+  // is never mutated). Persist it in place of the old history.
+  compactedHistory?: IConversationTurn[]
 }
 
 // Snapshot of a run handed to IPersistence hooks. Each hook receives the
@@ -337,6 +586,14 @@ export interface IRunSnapshot {
   text?: string
   error?: string
   completedAt?: number
+  // Running summary of trace[0, traceSummaryUpTo) once trace compaction has
+  // kicked in; prompts render it in place of those steps.
+  traceSummary?: string
+  traceSummaryUpTo?: number
+  // Skills activated so far (by the plan or by load_skill).
+  activeSkills?: string[]
+  // Tool calls made so far (counts against maxToolCalls on resume).
+  toolCallCount?: number
 }
 
 // Optional persistence facade. Write hooks fire at run start, after each

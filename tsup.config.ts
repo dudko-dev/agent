@@ -25,6 +25,19 @@ export default defineConfig([
     entry: { index: 'src/index.ts' },
     format: ['esm', 'cjs'],
     dts: true,
+    // The subagent tool resolves its worker entry with
+    // `new URL('./subagent-worker.js', import.meta.url)`; the shim gives the
+    // CJS build a real import.meta.url (pathToFileURL(__filename)).
+    shims: true,
+  },
+  {
+    ...shared,
+    // Worker-thread entry of createSubagentTool({ isolation: 'worker' }).
+    // ESM only (package "type": "module"); every build of the library -
+    // ESM, CJS and the CLI bundle - resolves it next to itself in dist/.
+    clean: false,
+    entry: { 'subagent-worker': 'src/subagent-worker.ts' },
+    format: ['esm'],
   },
   {
     ...shared,

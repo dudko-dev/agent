@@ -1,15 +1,47 @@
-import type { IConversationTurn, IPlan, IPlanStep, IStepResult } from './types.ts'
+import { isSummaryTurn } from './compaction.ts'
+import { renderActiveSkills, renderSkillsIndex } from './skills.ts'
+import { FIND_TOOLS_TOOL, renderSearchCatalog } from './tool-search.ts'
+import type {
+  IConversationTurn,
+  IPlan,
+  IPlanStep,
+  ISkill,
+  IStepResult,
+  IToolCatalogEntry,
+} from './types.ts'
+
+// ── Layout ───────────────────────────────────────────────────────────────
+// Every stage splits its prompt in two:
+//   SYSTEM - run-stable content only: role instructions, domain context,
+//            skills index, tool catalogue (where the stage shows one) and the
+//            active skills. Identical across the calls of a stage within a
+//            run, so provider prefix caches (OpenAI / Gemini implicit,
+//            Anthropic via an explicit breakpoint) hit.
+//   USER   - everything dynamic: history, request, plan, trace, state.
 
 const HISTORY_TURN_LIMIT = 8
 const HISTORY_CONTENT_LIMIT = 1500
+// A compaction summary carries more than an ordinary turn; give it room.
+const HISTORY_SUMMARY_LIMIT = 6000
 
 export const renderHistory = (history: IConversationTurn[] | undefined): string => {
   if (!history?.length) {
     return '(no prior conversation)'
   }
-  const tail = history.slice(-HISTORY_TURN_LIMIT)
-  const skipped = history.length - tail.length
+  // A leading compaction summary is always kept (it stands for every turn
+  // before it), and the 8-turn window applies to the rest.
+  const summary = isSummaryTurn(history[0]) ? history[0] : undefined
+  const rest = summary ? history.slice(1) : history
+  const tail = rest.slice(-HISTORY_TURN_LIMIT)
+  const skipped = rest.length - tail.length
   const lines: string[] = []
+  if (summary) {
+    const content =
+      summary.content.length > HISTORY_SUMMARY_LIMIT
+        ? `${summary.content.slice(0, HISTORY_SUMMARY_LIMIT)}... [truncated]`
+        : summary.content
+    lines.push(`${summary.role}: ${content}`)
+  }
   if (skipped > 0) {
     lines.push(`(${skipped} earlier turns omitted)`)
   }
@@ -29,6 +61,10 @@ const CATALOG_BUDGETS = {
 } as const
 
 export type CatalogMode = keyof typeof CATALOG_BUDGETS
+
+// How a stage renders the catalogue: the two classic budgets, or the grouped
+// short form of the 'search' strategy.
+export type PromptCatalogMode = CatalogMode | 'search'
 
 export const renderToolCatalog = (
   catalog: { name: string; description: string }[],
@@ -50,6 +86,9 @@ export const renderToolCatalog = (
   return lines.join('\n')
 }
 
+export const renderCatalogFor = (catalog: IToolCatalogEntry[], mode: PromptCatalogMode): string =>
+  mode === 'search' ? renderSearchCatalog(catalog) : renderToolCatalog(catalog, mode)
+
 const TOOL_OUTPUT_BUDGET = 1500
 
 const truncateOutput = (output: unknown): string => {
@@ -57,6 +96,9 @@ const truncateOutput = (output: unknown): string => {
   try {
     s = typeof output === 'string' ? output : JSON.stringify(output)
   } catch {
+    s = String(output)
+  }
+  if (s === undefined) {
     s = String(output)
   }
   return s.length > TOOL_OUTPUT_BUDGET
@@ -78,11 +120,30 @@ const renderTraceEntry = (r: IStepResult, idx: number): string => {
   ].join('\n')
 }
 
-export const renderTrace = (trace: IStepResult[]): string => {
+// Render steps whose first element sits at `offset` in the full trace.
+export const renderTraceSteps = (steps: IStepResult[], offset = 0): string =>
+  steps.map((r, i) => renderTraceEntry(r, offset + i)).join('\n')
+
+// A compacted view of the trace: steps [0, upTo) are represented by a
+// running summary, the rest verbatim.
+export interface ITraceView {
+  summary?: string
+  upTo: number
+}
+
+export const renderTrace = (trace: IStepResult[], view?: ITraceView): string => {
   if (trace.length === 0) {
     return '(no steps executed yet)'
   }
-  return trace.map(renderTraceEntry).join('\n')
+  const from = view?.summary ? Math.min(Math.max(view.upTo, 0), trace.length) : 0
+  if (from === 0) {
+    return renderTraceSteps(trace)
+  }
+  const lines = [`Summary of earlier steps (1-${from}): ${view!.summary}`]
+  if (from < trace.length) {
+    lines.push(renderTraceSteps(trace.slice(from), from))
+  }
+  return lines.join('\n')
 }
 
 export const renderPlan = (plan: IPlan): string =>
@@ -103,43 +164,106 @@ export const renderPlan = (plan: IPlan): string =>
 export const withDomainContext = (base: string, systemPrompt: string | undefined): string =>
   systemPrompt ? `${base}\n\nDomain context:\n${systemPrompt}` : base
 
-export const PLANNER_SYSTEM_BASE = `You are the Planner of a multi-step agent system.
+export const DEFAULT_PLAN_STEP_CAP = 8
+
+// The rule wording is load-bearing for small models: tests/live-model.test.ts
+// runs a 3B against it. A canned "Answer the user directly" mentioned next to
+// "never answer from memory" pulled the 3B into the answer-directly branch
+// (it then invented the secret), so rule 1 keeps that branch for trivial
+// tasks only and rule 4 sends questions the tools can answer to the tools.
+const plannerBase = (maxSteps: number): string => `You are the Planner of a multi-step agent system.
 
 Your only job is to decompose the user's request into a short ordered list of concrete actionable steps that a tool-using Executor can perform one at a time.
 
 Rules:
-1. Produce 1-5 steps for typical requests (hard cap is 8). Prefer FEWER, larger steps over many micro-steps. If the task is trivial and needs no tools, output a single step "Answer the user directly".
+1. Produce 1-5 steps for typical requests (hard cap is ${maxSteps}). Prefer FEWER, larger steps over many micro-steps. If the task is trivial and needs no tools, output a single step "Answer the user directly".
 2. Each step must be self-contained, action-oriented, and verifiable. State what should be done and what the expected outcome is.
 3. If a step needs a tool, suggest tool name(s) ONLY from the provided available-tools list. NEVER fabricate tool names.
 4. If the request asks for information that is likely retrievable via the available tools, plan to use them. If no tool fits, plan to answer from general knowledge.
 5. The last step must produce the deliverable for the user (do not append a separate "summarize" step - the system synthesizes the final answer).
-6. Output strict JSON matching the requested schema. No prose outside JSON.`
+6. The agent works autonomously: never plan a step that asks the user for clarification, confirmation or permission (the host handles tool consent). If the request is ambiguous, pick the most reasonable interpretation and state the assumption in the step description.
+7. Output strict JSON matching the requested schema. No prose outside JSON.`
+
+export const PLANNER_SYSTEM_BASE = plannerBase(DEFAULT_PLAN_STEP_CAP)
 
 const PLANNER_NARROWED_ADDENDUM = `
 
 ADDITIONAL RULE (tool-narrowed mode):
 The agent narrows the active tool set per-step using suggestedTools. You MUST set suggestedTools to the EXACT tool names the executor will use for that step. If a step is reasoning-only and needs no tools, leave suggestedTools empty. Missing or wrong suggestedTools will leave the executor without the tools it needs.`
 
-export const buildPlannerSystem = (mode: CatalogMode): string =>
-  mode === 'compact' ? PLANNER_SYSTEM_BASE + PLANNER_NARROWED_ADDENDUM : PLANNER_SYSTEM_BASE
+const PLANNER_SEARCH_ADDENDUM = `
 
-export const buildPlannerUserPrompt = (
-  input: string,
-  toolCatalog: { name: string; description: string }[],
-  history?: IConversationTurn[],
-  catalogMode: CatalogMode = 'full',
+ADDITIONAL RULE (tool-search mode):
+The tool catalogue is large; the list below may be abridged. suggestedTools are optional hints: name tools you are sure fit the step, the executor loads them up front and can discover any other tool itself with ${FIND_TOOLS_TOOL}. Never invent names.`
+
+const PLANNER_SKILLS_ADDENDUM = `
+
+SKILL SELECTION:
+Skills are packaged instructions for specific kinds of work. Set "skills" to the names of the skills from the SKILLS list below that apply to this request (leave it empty when none does). Their instructions are given to the executor.`
+
+export const buildPlannerSystem = (
+  mode: PromptCatalogMode,
+  maxSteps = DEFAULT_PLAN_STEP_CAP,
 ): string =>
+  plannerBase(maxSteps) +
+  (mode === 'compact'
+    ? PLANNER_NARROWED_ADDENDUM
+    : mode === 'search'
+      ? PLANNER_SEARCH_ADDENDUM
+      : '')
+
+export interface ISystemParts {
+  // config.systemPrompt
+  domain?: string
+  skills?: ISkill[]
+  activeSkills?: string[]
+}
+
+const skillsIndexSection = (skills: ISkill[] | undefined): string =>
+  skills?.length ? `\n\nSKILLS:\n${renderSkillsIndex(skills)}` : ''
+
+const activeSkillsSection = (
+  skills: ISkill[] | undefined,
+  active: string[] | undefined,
+): string => {
+  if (!skills?.length || !active?.length) {
+    return ''
+  }
+  const text = renderActiveSkills(skills, active)
+  return text ? `\n\nACTIVE SKILLS (follow these instructions where they apply):\n\n${text}` : ''
+}
+
+export const composePlannerSystem = (
+  parts: ISystemParts & {
+    mode: PromptCatalogMode
+    catalog: IToolCatalogEntry[]
+    maxSteps?: number
+  },
+): string =>
+  withDomainContext(
+    buildPlannerSystem(parts.mode, parts.maxSteps) +
+      (parts.skills?.length ? PLANNER_SKILLS_ADDENDUM : ''),
+    parts.domain,
+  ) +
+  skillsIndexSection(parts.skills) +
+  `\n\nAvailable tools:\n${renderCatalogFor(parts.catalog, parts.mode)}`
+
+export const buildPlannerUserPrompt = (input: string, history?: IConversationTurn[]): string =>
   [
     history?.length ? `Conversation history:\n${renderHistory(history)}\n` : '',
     `User request:\n${input}`,
-    '',
-    `Available tools:\n${renderToolCatalog(toolCatalog, catalogMode)}`,
     '',
     'Produce the plan now.',
   ]
     .filter(Boolean)
     .join('\n')
 
+// The executor's wording is measured, not tuned by taste: on the 3B the
+// release gate runs (tests/live-model.test.ts) any extra rule here - even a
+// one-line "never ask the user" - made it call the lookup AND echo a guessed
+// answer in parallel, then report the guess. Autonomy is carried by the
+// planner, replanner and synthesizer rules and by [BLOCKER] → replanner;
+// re-run the live test before touching this text.
 export const EXECUTOR_SYSTEM = `You are the Executor of a multi-step agent system. You receive ONE step at a time and you must accomplish only that step.
 
 Rules:
@@ -149,12 +273,33 @@ Rules:
 4. If the step is impossible with the available tools, or if you are otherwise blocked, explain the blocker briefly and end your reply with the literal token [BLOCKER] on its own line. The system uses this token (language-independent) to invoke the Replanner. Do not fabricate data.
 5. Be concise. Do not narrate your reasoning at length - the Replanner reads only your final summary.`
 
+const EXECUTOR_SEARCH_NOTE = `
+
+TOOLS:
+Only part of the tool catalogue is loaded. When you need a capability that is not among your tools, call ${FIND_TOOLS_TOOL} with a few keywords; the matching tools become callable from your next step on.`
+
+const EXECUTOR_SKILLS_NOTE = `
+
+SKILLS:
+Packaged instructions for specific kinds of work. When one of these applies to the current step and is not active yet, call load_skill with its name before doing the work; read_skill_file reads files it bundles.`
+
+export const composeExecutorSystem = (
+  parts: ISystemParts & { searchMode?: boolean; toolCount?: number },
+): string =>
+  withDomainContext(EXECUTOR_SYSTEM, parts.domain) +
+  (parts.skills?.length ? `${EXECUTOR_SKILLS_NOTE}\n${renderSkillsIndex(parts.skills)}` : '') +
+  (parts.searchMode
+    ? `${EXECUTOR_SEARCH_NOTE}${parts.toolCount ? ` The catalogue has ${parts.toolCount} tools.` : ''}`
+    : '') +
+  activeSkillsSection(parts.skills, parts.activeSkills)
+
 export const buildExecutorUserPrompt = (
   input: string,
   plan: IPlan,
   step: IPlanStep,
   trace: IStepResult[],
   history?: IConversationTurn[],
+  view?: ITraceView,
 ): string =>
   [
     history?.length ? `Conversation history:\n${renderHistory(history)}\n` : '',
@@ -162,7 +307,7 @@ export const buildExecutorUserPrompt = (
     '',
     `Overall plan:\n${renderPlan(plan)}`,
     '',
-    `Trace so far:\n${renderTrace(trace)}`,
+    `Trace so far:\n${renderTrace(trace, view)}`,
     '',
     `CURRENT STEP to execute (id=${step.id}): ${step.description}`,
     `Expected outcome: ${step.expectedOutcome}`,
@@ -173,39 +318,45 @@ export const buildExecutorUserPrompt = (
     .filter(Boolean)
     .join('\n')
 
-export const REPLANNER_SYSTEM = `You are the Replanner of a multi-step agent system. After each Executor step you decide what should happen next.
+export const REPLANNER_SYSTEM = `You are the Replanner of an autonomous multi-step agent system. After an Executor step you decide what should happen next.
 
 You have three options:
 - "continue": the next planned step is still appropriate.
 - "revise": the plan is wrong or incomplete given what we now know - produce a NEW plan covering only the REMAINING work (do not include already-completed steps). The new plan must follow the same rules as the original Planner.
-- "finish": we already have enough information to answer the user. The system will then synthesize the final answer from the trace.
+- "finish": we already have enough information to answer the user, or nothing more can be done. The system will then synthesize the final answer from the trace.
 
 Rules:
 1. Prefer "continue" when the original plan still applies. Revise only when needed.
 2. Prefer "finish" as soon as the user's request is satisfied - do not run unnecessary extra steps.
-3. When revising, the new plan must NOT repeat already-completed work; it covers only what is still needed.
-4. Output strict JSON matching the schema. No prose outside JSON.`
+3. When a step failed or was blocked, prefer revising around the failure (another tool, other arguments, another source, a reasonable assumption) over finishing with nothing. Finish only when no workable alternative remains.
+4. Never revise into a step that asks the user for input, clarification or permission - the agent runs autonomously.
+5. When revising, the new plan must NOT repeat already-completed work; it covers only what is still needed.
+6. Output strict JSON matching the schema. No prose outside JSON.`
+
+export const composeReplannerSystem = (
+  parts: ISystemParts & { mode: PromptCatalogMode; catalog: IToolCatalogEntry[] },
+): string =>
+  withDomainContext(REPLANNER_SYSTEM, parts.domain) +
+  `\n\nAvailable tools (for the revise option):\n${renderCatalogFor(parts.catalog, parts.mode)}` +
+  activeSkillsSection(parts.skills, parts.activeSkills)
 
 export const buildReplannerUserPrompt = (
   input: string,
   plan: IPlan,
   trace: IStepResult[],
   nextStep: IPlanStep | null,
-  toolCatalog: { name: string; description: string }[],
-  catalogMode: CatalogMode = 'full',
+  view?: ITraceView,
 ): string =>
   [
     `Original user request:\n${input}`,
     '',
     `Current plan:\n${renderPlan(plan)}`,
     '',
-    `Completed steps:\n${renderTrace(trace)}`,
+    `Completed steps:\n${renderTrace(trace, view)}`,
     '',
     nextStep
       ? `Next planned step: [${nextStep.id}] ${nextStep.description}`
       : 'There is no next step in the current plan.',
-    '',
-    `Available tools (for revise option):\n${renderToolCatalog(toolCatalog, catalogMode)}`,
     '',
     'Decide now: continue, revise, or finish.',
   ].join('\n')
@@ -213,16 +364,23 @@ export const buildReplannerUserPrompt = (
 export const SYNTHESIZER_SYSTEM = `You are the Synthesizer. Produce the final answer for the user from the agent's plan and execution trace.
 
 Rules:
-1. Answer the user directly and concisely. Do NOT mention "steps", "plans", or internal mechanics unless the user explicitly asked for them.
-2. Use facts from the trace verbatim when accuracy matters (names, IDs, numbers, quotes).
-3. If the trace shows the request could not be completed, say so plainly and explain what blocked it.
-4. Use the user's language.`
+1. Answer the user directly and concisely: report what was done and what was found. Do NOT mention "steps", "plans", or internal mechanics unless the user explicitly asked for them.
+2. Use facts from the trace verbatim when accuracy matters (names, IDs, numbers, quotes). Never invent results the trace does not contain.
+3. Mention the assumptions the agent made, briefly.
+4. If the trace shows the request (or part of it) could not be completed, say so plainly and explain what blocked it.
+5. Do not end with questions or offers unless the request genuinely cannot be completed without input from the user.
+6. Use the user's language.`
+
+export const composeSynthesizerSystem = (parts: ISystemParts): string =>
+  withDomainContext(SYNTHESIZER_SYSTEM, parts.domain) +
+  activeSkillsSection(parts.skills, parts.activeSkills)
 
 export const buildSynthesizerUserPrompt = (
   input: string,
   plan: IPlan,
   trace: IStepResult[],
   history?: IConversationTurn[],
+  view?: ITraceView,
 ): string =>
   [
     history?.length ? `Conversation history:\n${renderHistory(history)}\n` : '',
@@ -230,7 +388,7 @@ export const buildSynthesizerUserPrompt = (
     '',
     `Plan that was executed:\n${renderPlan(plan)}`,
     '',
-    `Execution trace:\n${renderTrace(trace)}`,
+    `Execution trace:\n${renderTrace(trace, view)}`,
     '',
     'Write the final answer for the user now.',
   ]

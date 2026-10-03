@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { beforeEach } from 'node:test'
-import { loadConfig } from '../src/cli/config.ts'
+import { loadConfig, parseThinking, skillsDirFromEnv } from '../src/cli/config.ts'
 
 const CONFIG_KEYS = [
   'AGENT_PROVIDER_TYPE',
@@ -30,6 +30,15 @@ const CONFIG_KEYS = [
   'AGENT_PROVIDER_OPTIONS',
   'AGENT_PLANNER_PROVIDER_OPTIONS',
   'AGENT_SYNTHESIZER_PROVIDER_OPTIONS',
+  'AGENT_THINKING',
+  'AGENT_MAX_INPUT_TOKENS',
+  'AGENT_MAX_OUTPUT_TOKENS',
+  'AGENT_MAX_REASONING_TOKENS',
+  'AGENT_MAX_TOOL_CALLS',
+  'AGENT_TOOL_APPROVAL',
+  'AGENT_SKILLS_DIR',
+  'AGENT_CONTEXT_WINDOW_TOKENS',
+  'AGENT_COMPACTION',
 ] as const
 
 beforeEach(() => {
@@ -228,4 +237,61 @@ test('loadConfig threads AGENT_PLANNER_PROVIDER_OPTIONS into the planner overrid
     apiKey: undefined,
     providerOptions: { accountId: 'acc-from-env' },
   })
+})
+
+test('loadConfig leaves every new knob undefined when its env var is unset', () => {
+  setMinimalOpenAi()
+  const c = loadConfig()
+  assert.equal(c.thinking, undefined)
+  assert.equal(c.limits, undefined)
+  assert.equal(c.maxToolCalls, undefined)
+  assert.equal(c.toolApproval, undefined)
+  assert.equal(c.compaction, undefined)
+  assert.equal(c.toolSelectionStrategy, undefined)
+  assert.equal(skillsDirFromEnv(), undefined)
+})
+
+test('AGENT_THINKING: levels, off, and a numeric budget', () => {
+  assert.equal(parseThinking(undefined), undefined)
+  assert.equal(parseThinking('HIGH'), 'high')
+  assert.equal(parseThinking('off'), 'none')
+  assert.equal(parseThinking('minimal'), 'minimal')
+  assert.deepEqual(parseThinking('4096'), { level: 'medium', budgetTokens: 4096 })
+  assert.throws(() => parseThinking('turbo'), /AGENT_THINKING/)
+  setMinimalOpenAi()
+  process.env.AGENT_THINKING = 'xhigh'
+  assert.equal(loadConfig().thinking, 'xhigh')
+})
+
+test('loadConfig parses token limits, the tool-call cap and the approval mode', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_MAX_INPUT_TOKENS = '1000'
+  process.env.AGENT_MAX_OUTPUT_TOKENS = '200'
+  process.env.AGENT_MAX_REASONING_TOKENS = '50'
+  process.env.AGENT_MAX_TOTAL_TOKENS = '1500'
+  process.env.AGENT_MAX_TOOL_CALLS = '12'
+  process.env.AGENT_TOOL_APPROVAL = 'ask-writes'
+  const c = loadConfig()
+  assert.deepEqual(c.limits, { maxInputTokens: 1000, maxOutputTokens: 200, maxReasoningTokens: 50 })
+  assert.equal(c.maxTotalTokens, 1500, 'the legacy total cap keeps its slot')
+  assert.equal(c.maxToolCalls, 12)
+  assert.deepEqual(c.toolApproval, { mode: 'ask-writes' })
+  process.env.AGENT_TOOL_APPROVAL = 'yolo'
+  assert.throws(() => loadConfig(), /AGENT_TOOL_APPROVAL/)
+})
+
+test('loadConfig parses compaction and the new tool strategies; AGENT_SKILLS_DIR is read raw', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_COMPACTION = 'off'
+  process.env.AGENT_CONTEXT_WINDOW_TOKENS = '32000'
+  process.env.AGENT_TOOL_SELECTION_STRATEGY = 'search'
+  process.env.AGENT_SKILLS_DIR = ' ./skills '
+  const c = loadConfig()
+  assert.deepEqual(c.compaction, { auto: false, contextWindowTokens: 32000 })
+  assert.equal(c.toolSelectionStrategy, 'search')
+  assert.equal(skillsDirFromEnv(), './skills')
+  process.env.AGENT_TOOL_SELECTION_STRATEGY = 'auto'
+  assert.equal(loadConfig().toolSelectionStrategy, 'auto')
+  process.env.AGENT_COMPACTION = 'sometimes'
+  assert.throws(() => loadConfig(), /AGENT_COMPACTION/)
 })

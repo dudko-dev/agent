@@ -1,12 +1,23 @@
-import { stepCountIs, streamText, type ToolSet } from 'ai'
+import { stepCountIs, streamText, type ModelMessage, type StopCondition, type ToolSet } from 'ai'
+import { resolvePromptCaching, withRollingBreakpoint } from './caching.ts'
+import { resolveCompaction } from './compaction.ts'
+import { createToolResultClearer } from './context-editing.ts'
+import { stageCallOptions } from './call-options.ts'
 import type { IAgentInternalContext } from './internal.ts'
-import { EXECUTOR_SYSTEM, buildExecutorUserPrompt, withDomainContext } from './prompts.ts'
+import { hasTokenLimits, limitsStopCondition, resolveLimits } from './limits.ts'
+import { effectiveToolStrategy } from './planner.ts'
+import { buildExecutorUserPrompt, composeExecutorSystem } from './prompts.ts'
+import { stageEmitsThoughts } from './thinking.ts'
+import { MAX_CARRIED_DISCOVERED_TOOLS } from './tool-search.ts'
 import { ATTR, withSpan } from './tracing.ts'
 import type { IConversationTurn, IPlan, IPlanStep, IStepResult, IUsage } from './types.ts'
-import { withRetry, withTimeout } from './utils.ts'
+import { emptyUsage, normalizeUsage, withRetry, withTimeout } from './utils.ts'
 
+// The host + MCP tools a step may use under 'all' / 'plan-narrowed' (the
+// 'search' strategy builds its active set per LLM step instead; built-in
+// tools are added on top by the executor).
 export const buildActiveToolSet = (ctx: IAgentInternalContext, step: IPlanStep): ToolSet => {
-  if (ctx.config.toolSelectionStrategy !== 'plan-narrowed') {
+  if (effectiveToolStrategy(ctx) !== 'plan-narrowed') {
     return ctx.tools
   }
   const allowed = new Set(step.suggestedTools ?? [])
@@ -103,6 +114,38 @@ export const executeStep = async (
     },
   )
 
+// Tools for one executor call: what the strategy exposes + the built-ins.
+// In 'search' mode the full catalogue is passed and `prepareStep` narrows
+// each LLM step to the active set (find_tools grows it mid-call).
+export const buildExecutorTools = (
+  ctx: IAgentInternalContext,
+  step: IPlanStep,
+): { tools: ToolSet; activeTools?: string[]; active?: Set<string> } => {
+  const strategy = effectiveToolStrategy(ctx)
+  const builtins = ctx.builtinTools ?? {}
+  if (strategy === 'search') {
+    const tools: ToolSet = { ...ctx.tools, ...builtins, ...(ctx.findTools ?? {}) }
+    const active = new Set<string>([...Object.keys(builtins), ...Object.keys(ctx.findTools ?? {})])
+    for (const name of step.suggestedTools ?? []) {
+      if (ctx.tools[name]) {
+        active.add(name)
+      }
+    }
+    for (const name of (ctx.run?.discovered ?? []).slice(-MAX_CARRIED_DISCOVERED_TOOLS)) {
+      if (ctx.tools[name]) {
+        active.add(name)
+      }
+    }
+    return { tools, active }
+  }
+  const base = buildActiveToolSet(ctx, step)
+  const tools: ToolSet = Object.keys(builtins).length ? { ...base, ...builtins } : base
+  // Defence-in-depth: explicitly tell the SDK which tools are callable in
+  // this step. Only worth it in narrowed mode; in 'all' mode it's just a
+  // copy of every key, equivalent to omitting the field.
+  return strategy === 'plan-narrowed' ? { tools, activeTools: Object.keys(tools) } : { tools }
+}
+
 const runOnce = async (
   input: string,
   plan: IPlan,
@@ -115,8 +158,11 @@ const runOnce = async (
   const toolCalls: IStepResult['toolCalls'] = []
   const toolInputs = new Map<string, { name: string; input: unknown }>()
 
-  const activeTools = buildActiveToolSet(ctx, step)
-  const narrowed = ctx.config.toolSelectionStrategy === 'plan-narrowed'
+  const { tools, activeTools, active } = buildExecutorTools(ctx, step)
+  const run = ctx.run
+  if (run) {
+    run.stepActive = active
+  }
 
   const sanitizeForEvent = async (toolName: string, raw: unknown): Promise<unknown> => {
     const fn = ctx.config.inputSanitizer
@@ -140,16 +186,95 @@ const runOnce = async (
     }
   }
 
+  // Stop conditions: the per-step LLM-step cap, plus the run-level token /
+  // tool-call budgets so a runaway tool loop stops at the next step boundary
+  // instead of at the end of the step.
+  let stoppedBy: 'tokens' | 'tool-calls' | undefined
+  const stopWhen: StopCondition<ToolSet>[] = [stepCountIs(ctx.config.maxStepsPerTask)]
+  const limits = resolveLimits(ctx.config)
+  if (run && hasTokenLimits(limits)) {
+    stopWhen.push(
+      limitsStopCondition(
+        () => run.usage,
+        limits,
+        () => {
+          stoppedBy = 'tokens'
+        },
+      ),
+    )
+  }
+  const maxToolCalls = ctx.config.maxToolCalls
+  if (run && typeof maxToolCalls === 'number' && maxToolCalls > 0) {
+    stopWhen.push(() => {
+      if (run.toolCalls >= maxToolCalls) {
+        stoppedBy ??= 'tool-calls'
+        return true
+      }
+      return false
+    })
+  }
+
+  const call = stageCallOptions(
+    ctx.config,
+    'executor',
+    composeExecutorSystem({
+      domain: ctx.config.systemPrompt,
+      skills: ctx.skills,
+      activeSkills: run?.activeSkills,
+      searchMode: Boolean(active),
+      toolCount: ctx.toolCatalog.length,
+    }),
+  )
+  const emitThoughts = stageEmitsThoughts(ctx.config, 'executor')
+  const view = run ? { summary: run.traceSummary, upTo: run.traceSummaryUpTo } : undefined
+
+  // Before every round: re-read the search-mode active set (find_tools grows
+  // it), clear stale tool results past the threshold, and roll the cache
+  // breakpoint to the newest message.
+  const caching = resolvePromptCaching(ctx.config.promptCaching)
+  const compaction = resolveCompaction(ctx.config.compaction)
+  const clear =
+    compaction.clearToolResultsAfterTokens > 0
+      ? createToolResultClearer(
+          {
+            triggerTokens: compaction.clearToolResultsAfterTokens,
+            keep: compaction.keepToolResults,
+          },
+          (info) => {
+            ctx.emit({
+              type: 'log',
+              level: 'info',
+              message: `[executor] cleared ${info.cleared} stale tool result(s) from the step's context`,
+            })
+            ctx.emit({
+              type: 'context.compacted',
+              scope: 'tool-results',
+              beforeTokens: info.beforeTokens,
+              afterTokens: info.afterTokens,
+            })
+          },
+        )
+      : undefined
+  const editMessages = caching.enabled || Boolean(clear)
+
   const result = streamText({
     model: ctx.executorModel,
-    tools: activeTools,
-    // Defence-in-depth: explicitly tell the SDK which tools are callable in
-    // this step. Only worth it in narrowed mode; in 'all' mode it's just a
-    // copy of every key, equivalent to omitting the field.
-    ...(narrowed ? { activeTools: Object.keys(activeTools) } : {}),
-    stopWhen: stepCountIs(ctx.config.maxStepsPerTask),
-    system: withDomainContext(EXECUTOR_SYSTEM, ctx.config.systemPrompt),
-    prompt: buildExecutorUserPrompt(input, plan, step, trace, history),
+    tools,
+    ...(activeTools ? { activeTools } : {}),
+    ...(active || editMessages
+      ? {
+          prepareStep: ({ messages }: { messages: ModelMessage[] }) => {
+            const next = withRollingBreakpoint(clear ? clear(messages) : messages, caching)
+            return {
+              ...(active ? { activeTools: [...active].filter((name) => name in tools) } : {}),
+              ...(editMessages ? { messages: next } : {}),
+            }
+          },
+        }
+      : {}),
+    stopWhen,
+    ...call,
+    prompt: buildExecutorUserPrompt(input, plan, step, trace, history, view),
     abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
   })
 
@@ -160,6 +285,11 @@ const runOnce = async (
           ctx.emit({ type: 'step.text-delta', step, delta: part.text })
         }
         break
+      case 'reasoning-delta':
+        if (part.text && emitThoughts) {
+          ctx.emit({ type: 'step.reasoning-delta', step, delta: part.text })
+        }
+        break
       case 'tool-call': {
         const sanitizedInput = await sanitizeForEvent(part.toolName, part.input)
         toolInputs.set(part.toolCallId, { name: part.toolName, input: sanitizedInput })
@@ -167,6 +297,10 @@ const runOnce = async (
         break
       }
       case 'tool-result': {
+        // A streaming tool's intermediate values; only the final one counts.
+        if ((part as { preliminary?: boolean }).preliminary) {
+          break
+        }
         const known = toolInputs.get(part.toolCallId)
         // Fallback path is defensive (tool-result before tool-call should
         // not happen). Sanitize the raw fallback input so an out-of-order
@@ -219,18 +353,16 @@ const runOnce = async (
   const summary =
     cleaned.length > 0
       ? truncateForTrace(cleaned)
-      : toolCalls.length > 0
-        ? `Executed ${toolCalls.length} tool call(s) without producing a final message; consider raising maxStepsPerTask.`
-        : 'Step produced no output.'
+      : stoppedBy
+        ? `Stopped early: the run's ${stoppedBy === 'tokens' ? 'token' : 'tool-call'} budget was reached after ${toolCalls.length} tool call(s).`
+        : toolCalls.length > 0
+          ? `Executed ${toolCalls.length} tool call(s) without producing a final message; consider raising maxStepsPerTask.`
+          : 'Step produced no output.'
 
   return {
     summary,
     toolCalls,
     blocked,
-    usage: {
-      inputTokens: usage.inputTokens ?? 0,
-      outputTokens: usage.outputTokens ?? 0,
-      totalTokens: usage.totalTokens ?? 0,
-    },
+    usage: usage ? normalizeUsage(usage) : emptyUsage(),
   }
 }

@@ -147,6 +147,7 @@ export const startLocalMcp = async (opts: ILocalMcpOptions = {}): Promise<ILocal
       {
         description: 'Return the server-side secret code. There is no other way to learn it.',
         inputSchema: {},
+        annotations: { readOnlyHint: true },
       },
       () => {
         calls.push({ name: 'secret', args: {} })
