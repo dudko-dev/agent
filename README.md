@@ -354,7 +354,7 @@ A denied call throws `ToolDeniedError` inside the tool, so the step records `ok:
 promptCaching: { ttl: '1h', key: 'my-app' } // or false to send plain system strings
 ```
 
-Inside a step's tool loop a second Anthropic breakpoint **rolls to the newest message** every round, so each round reads all earlier rounds from the cache and writes only the new tail (`withRollingBreakpoint`; earlier message breakpoints are removed, so a request carries at most two — Anthropic allows four). Tools are sent and catalogued **sorted by name**, so the tool list that heads every cached prefix is identical however the MCP servers connected.
+Inside a step's tool loop a second Anthropic breakpoint **rolls to the newest message** every round, so each round reads all earlier rounds from the cache and writes only the new tail (`withRollingBreakpoint`; earlier message breakpoints are removed, so a request carries at most two — Anthropic allows four). Tools keep **declaration order** — servers connect concurrently but mount in the order they are configured — so the tool list that heads every cached prefix is identical from run to run without reordering what a server declared (a small model was measured to depend on that order).
 
 Usage reports `cachedInputTokens` / `cacheWriteTokens`, so the effect is measurable.
 
@@ -364,7 +364,7 @@ The practices coding agents (Claude Code, the Claude and GitHub Copilot extensio
 
 | Practice | How | Knob |
 | --- | --- | --- |
-| Stable, cacheable prefix | run-stable system prompts, sorted tools, dynamic content last | `promptCaching` |
+| Stable, cacheable prefix | run-stable system prompts, deterministic tool order, dynamic content last | `promptCaching` |
 | Cache the growing loop | rolling Anthropic breakpoint; OpenAI `promptCacheKey` per stage | `promptCaching: { ttl }` |
 | Don't send every tool | compact catalogue + `find_tools` above the threshold (deferred tools) | `toolSelectionStrategy`, `toolSearchThreshold` |
 | Load instructions on demand | skills: name + description in the prompt, body on activation | `skills` |

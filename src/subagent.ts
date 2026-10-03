@@ -142,11 +142,25 @@ export const subagentWorkerUrl = (): URL => {
   return new URL(here.endsWith('.ts') ? './subagent-worker.ts' : './subagent-worker.js', here)
 }
 
-// The parent's node flags minus the ones that describe ITS entry point
-// (-e / -p / --input-type would make the worker misread its own file).
-// Everything else - notably --experimental-strip-types for source runs - is
-// inherited.
-export const workerExecArgv = (argv: readonly string[] = process.execArgv): string[] => {
+// The worker's node flags. By default (undefined) a worker inherits the
+// parent's options itself - notably --experimental-strip-types for source runs
+// - and Node drops the per-process ones a worker can't take; passing
+// process.execArgv explicitly instead fails on Node 24 under `node --test`
+// ("Initiated Worker with invalid execArgv flags: --stack-trace-limit…").
+// Only when the parent's flags describe ITS entry point (-e / -p /
+// --input-type would make the worker misread its own file) is an explicit,
+// filtered list needed.
+export const workerExecArgv = (
+  argv: readonly string[] = process.execArgv,
+): string[] | undefined => {
+  const entryPoint = argv.some(
+    (a) =>
+      ['-e', '--eval', '-p', '--print', '--input-type'].includes(a) ||
+      /^--(input-type|eval|print)=/.test(a),
+  )
+  if (!entryPoint) {
+    return undefined
+  }
   const out: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -273,9 +287,10 @@ const runInWorker = (
     let settled = false
     let worker: Worker
     try {
+      const execArgv = workerExecArgv()
       worker = new Worker(subagentWorkerUrl(), {
         workerData: { subagent: opts.name },
-        execArgv: workerExecArgv(),
+        ...(execArgv ? { execArgv } : {}),
       })
     } catch (err) {
       reject(err)

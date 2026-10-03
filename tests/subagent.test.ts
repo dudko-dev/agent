@@ -52,6 +52,15 @@ test('workerExecArgv keeps runtime flags and drops the entry-point ones', () => 
   )
 })
 
+test('workerExecArgv: without entry-point flags the worker inherits the options itself', () => {
+  // An explicit list breaks on Node 24 under `node --test`, whose execArgv
+  // carries per-process flags a worker rejects.
+  assert.equal(
+    workerExecArgv(['--experimental-strip-types', '--stack-trace-limit=10', '--v8-pool-size=4']),
+    undefined,
+  )
+})
+
 test('toCloneable / slimEvent: Errors become messages only when cloning fails; long strings clipped', () => {
   const withFn = { a: 1, f: () => 1, e: new Error('boom') }
   assert.deepEqual(toCloneable(withFn), { a: 1, e: 'boom' })

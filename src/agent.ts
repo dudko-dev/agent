@@ -334,17 +334,13 @@ export const createAgent = async (
     throw err
   }
 
-  // Sorted by name, so the catalogue rendered into the (cached) planner prompt
-  // is the same whatever order the servers answered in.
   const toEntries = (catalog: typeof connected.catalog): IToolCatalogEntry[] =>
-    catalog
-      .map((c) => ({
-        name: c.name,
-        description: c.description,
-        server: c.server,
-        readOnly: c.readOnly === true,
-      }))
-      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    catalog.map((c) => ({
+      name: c.name,
+      description: c.description,
+      server: c.server,
+      readOnly: c.readOnly === true,
+    }))
 
   const ctx: IAgentInternalContext = {
     config,

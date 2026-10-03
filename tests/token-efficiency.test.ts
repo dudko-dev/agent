@@ -78,7 +78,7 @@ const config = (baseURL: string, extra: Partial<IAgentConfig>): IAgentConfig => 
   ...extra,
 })
 
-test('tool loop: stale results are cleared on the wire, reported, and tools go in name order', async () => {
+test('tool loop: stale results are cleared on the wire, reported; tools keep declaration order', async () => {
   const big = 'y'.repeat(4000)
   const executorRequests: IChatRequest[] = []
   const script: Script = (req) => {
@@ -123,8 +123,10 @@ test('tool loop: stale results are cleared on the wire, reported, and tools go i
       events.some((e) => e.type === 'context.compacted' && e.scope === 'tool-results'),
       'the clearing is reported',
     )
-    const names = toolNames(executorRequests[0])
-    assert.deepEqual(names, [...names].sort())
+    // Declaration order, not sorted: servers mount in declaration order (so the
+    // cached prefix is stable already), and a server's own order is what a
+    // small model was measured against.
+    assert.deepEqual(toolNames(executorRequests[0]), ['zeta', 'page'])
   } finally {
     await agent.close()
     await llm.close()

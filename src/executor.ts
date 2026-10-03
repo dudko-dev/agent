@@ -114,11 +114,6 @@ export const executeStep = async (
     },
   )
 
-// The tool set with its keys in name order: the tool list heads every cached
-// prompt prefix, so it must be identical however the MCP servers connected.
-export const sortTools = <T extends Record<string, unknown>>(tools: T): T =>
-  Object.fromEntries(Object.entries(tools).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) as T
-
 // Tools for one executor call: what the strategy exposes + the built-ins.
 // In 'search' mode the full catalogue is passed and `prepareStep` narrows
 // each LLM step to the active set (find_tools grows it mid-call).
@@ -141,10 +136,10 @@ export const buildExecutorTools = (
         active.add(name)
       }
     }
-    return { tools: sortTools(tools), active }
+    return { tools, active }
   }
   const base = buildActiveToolSet(ctx, step)
-  const tools: ToolSet = sortTools(Object.keys(builtins).length ? { ...base, ...builtins } : base)
+  const tools: ToolSet = Object.keys(builtins).length ? { ...base, ...builtins } : base
   // Defence-in-depth: explicitly tell the SDK which tools are callable in
   // this step. Only worth it in narrowed mode; in 'all' mode it's just a
   // copy of every key, equivalent to omitting the field.
