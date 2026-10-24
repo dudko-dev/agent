@@ -1,6 +1,6 @@
 {
   "name": "@dudko.dev/agent",
-  "version": "0.0.33",
+  "version": "0.0.34",
   "type": "module",
   "description": "Tool-using planning agent over MCP servers, built on the Vercel AI SDK.",
   "keywords": [
@@ -89,9 +89,9 @@
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.1",
-    "@opentelemetry/api": "^1.9.1",
-    "ai": "^7.0.143",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@opentelemetry/api": "^1.10.0",
+    "ai": "^7.0.152",
     "zod": "^4.6.7"
   },
   "peerDependencies": {
@@ -139,20 +139,20 @@
     }
   },
   "devDependencies": {
-    "@ai-sdk/amazon-bedrock": "^5.0.118",
-    "@ai-sdk/anthropic": "^4.0.82",
-    "@ai-sdk/azure": "^4.0.104",
-    "@ai-sdk/deepseek": "^3.0.67",
-    "@ai-sdk/google": "^4.0.99",
-    "@ai-sdk/google-vertex": "^5.0.115",
-    "@ai-sdk/openai": "^4.0.96",
-    "@ai-sdk/openai-compatible": "^3.0.71",
-    "@ai-sdk/xai": "^5.0.24",
+    "@ai-sdk/amazon-bedrock": "^5.0.123",
+    "@ai-sdk/anthropic": "^4.0.87",
+    "@ai-sdk/azure": "^4.0.109",
+    "@ai-sdk/deepseek": "^3.0.72",
+    "@ai-sdk/google": "^4.0.104",
+    "@ai-sdk/google-vertex": "^5.0.121",
+    "@ai-sdk/openai": "^4.0.101",
+    "@ai-sdk/openai-compatible": "^3.0.77",
+    "@ai-sdk/xai": "^5.0.29",
     "@types/node": "^22.9.0",
     "prettier": "^3.9.10",
     "tsup": "^9.0.0",
     "typescript": "^6.0.3",
-    "workers-ai-provider": "^4.0.0"
+    "workers-ai-provider": "^4.0.1"
   },
   "engines": {
     "node": ">=22.6.0"
