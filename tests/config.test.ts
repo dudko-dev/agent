@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { beforeEach } from 'node:test'
-import { loadConfig, parseThinking, skillsDirFromEnv } from '../src/cli/config.ts'
+import { loadConfig, parseThinking, parseToolRules, skillsDirFromEnv } from '../src/cli/config.ts'
+import { decideToolPermission } from '../src/index.ts'
 
 const CONFIG_KEYS = [
   'AGENT_PROVIDER_TYPE',
@@ -36,6 +37,7 @@ const CONFIG_KEYS = [
   'AGENT_MAX_REASONING_TOKENS',
   'AGENT_MAX_TOOL_CALLS',
   'AGENT_TOOL_APPROVAL',
+  'AGENT_TOOL_RULES',
   'AGENT_SKILLS_DIR',
   'AGENT_CONTEXT_WINDOW_TOKENS',
   'AGENT_COMPACTION',
@@ -294,4 +296,62 @@ test('loadConfig parses compaction and the new tool strategies; AGENT_SKILLS_DIR
   assert.equal(loadConfig().toolSelectionStrategy, 'auto')
   process.env.AGENT_COMPACTION = 'sometimes'
   assert.throws(() => loadConfig(), /AGENT_COMPACTION/)
+})
+
+// ── AGENT_TOOL_RULES: the CLI's counterpart of a settings file's permissions ──
+
+const RULES = { 'github__delete_*': 'deny', 'docs__*': 'allow', docs__write: 'ask' }
+
+test('AGENT_TOOL_RULES: rules reach toolApproval, with or without a mode', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_TOOL_RULES = JSON.stringify(RULES)
+  assert.deepEqual(
+    loadConfig().toolApproval,
+    { rules: RULES },
+    'no mode set: the default applies and the rules still hold',
+  )
+  process.env.AGENT_TOOL_APPROVAL = 'read-only'
+  assert.deepEqual(loadConfig().toolApproval, { mode: 'read-only', rules: RULES })
+})
+
+test('AGENT_TOOL_RULES: a parsed rule really decides a call — a deny holds even under autopilot', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_TOOL_RULES = JSON.stringify(RULES)
+  const rules = loadConfig().toolApproval?.rules
+  const decide = (name: string, mode: 'autopilot' | 'read-only' = 'autopilot') =>
+    decideToolPermission({ name, readOnly: false, mode, rules })
+  assert.equal(decide('github__delete_repo').permission, 'deny', 'a glob deny beats autopilot')
+  assert.equal(decide('docs__read', 'read-only').permission, 'allow', 'an allow beats read-only')
+  assert.equal(decide('docs__write').permission, 'ask', 'the exact rule beats the docs__* glob')
+  assert.equal(decide('unrelated__tool').permission, 'allow', 'no rule: the mode decides')
+})
+
+test('AGENT_TOOL_RULES: unset or blank leaves toolApproval untouched', () => {
+  setMinimalOpenAi()
+  assert.equal(loadConfig().toolApproval, undefined)
+  process.env.AGENT_TOOL_RULES = '   '
+  assert.equal(loadConfig().toolApproval, undefined)
+  process.env.AGENT_TOOL_RULES = '{}'
+  assert.equal(loadConfig().toolApproval, undefined, 'an empty object is no rules')
+  process.env.AGENT_TOOL_APPROVAL = 'ask-all'
+  assert.deepEqual(loadConfig().toolApproval, { mode: 'ask-all' }, 'the mode alone is unchanged')
+})
+
+test('AGENT_TOOL_RULES: refuses what it cannot trust, loudly and at startup', () => {
+  setMinimalOpenAi()
+  const bad: [string, RegExp][] = [
+    ['{not json', /JSON object/],
+    ['["deny"]', /JSON object/],
+    ['"deny"', /JSON object/],
+    ['42', /JSON object/],
+    // The case this guards: a typo must not leave a destructive tool open.
+    ['{"github__delete_*":"dney"}', /must be allow \| ask \| deny/],
+    ['{"github__delete_*":true}', /must be allow \| ask \| deny/],
+    ['{" ":"deny"}', /non-empty/],
+  ]
+  for (const [raw, expected] of bad) {
+    process.env.AGENT_TOOL_RULES = raw
+    assert.throws(() => loadConfig(), expected, `rejects ${raw}`)
+    assert.throws(() => parseToolRules(raw), /AGENT_TOOL_RULES/)
+  }
 })

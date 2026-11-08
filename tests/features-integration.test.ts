@@ -10,6 +10,7 @@ import {
   type AgentEvent,
   type IAgent,
   type IAgentConfig,
+  type IPersistence,
   type IRunSnapshot,
   type IToolApprovalRequest,
 } from '../src/index.ts'
@@ -756,5 +757,126 @@ test('subagent (worker): aborting the parent run aborts the child', async () => 
       (err: unknown) => (err as Error).name === 'AbortError',
     )
     assert.ok(Date.now() - started < 10_000)
+  })
+})
+
+// ── resume ─────────────────────────────────────────────────────────────────
+// `resolveResume` is unit-tested for what it REFUSES. What matters to someone
+// whose process died mid-run is that a run really CONTINUES: from the saved
+// plan and trace, without re-planning and without repeating a finished step.
+// The proof is the model's call log, not the final text — a resumed run that
+// quietly redid everything would still end with the same answer.
+
+const resumeScript: Script = (req) => {
+  switch (stageOf(req)) {
+    case 'planner':
+      return { text: planJson([{ id: 's1' }, { id: 's2' }, { id: 's3' }]) }
+    case 'executor':
+      return { text: `did ${stepOf(req)}` }
+    case 'replanner':
+      return { text: JSON.stringify({ mode: 'continue', reason: 'on track' }) }
+    default:
+      return { text: 'All three steps done.' }
+  }
+}
+
+/**
+ * A store that behaves like a real one after a crash: it holds the last
+ * checkpoint and nothing else, because a dead process never writes
+ * `onRunComplete`. `dieAfter` aborts the run right after that many steps have
+ * been checkpointed.
+ */
+const crashingStore = (dieAfter: number) => {
+  const saved = new Map<string, IRunSnapshot>()
+  const started: string[] = []
+  const controller = new AbortController()
+  const persistence: IPersistence = {
+    onRunStart: (snapshot) => {
+      started.push(snapshot.runId)
+      saved.set(snapshot.runId, snapshot)
+    },
+    onStepComplete: (snapshot) => {
+      saved.set(snapshot.runId, snapshot)
+      if (snapshot.trace.length === dieAfter) controller.abort()
+    },
+    loadRun: (runId) => saved.get(runId) ?? null,
+  }
+  return { saved, started, controller, persistence }
+}
+
+test('resume: a run interrupted after a step continues from its checkpoint and finishes', async () => {
+  await withLlm(resumeScript, async ({ llm, open }) => {
+    const { saved, started, controller, persistence } = crashingStore(1)
+
+    const first = await open(config(llm.baseURL, { persistence }))
+    await assert.rejects(
+      first.run({ input: 'do three things', signal: controller.signal }),
+      /abort/i,
+      'the first process dies mid-run',
+    )
+    assert.equal(saved.size, 1)
+    const [runId] = [...saved.keys()]
+    assert.equal(saved.get(runId)?.trace.length, 1, 'one finished step was checkpointed')
+
+    // A NEW agent, as after a restart, resumes by id. The input passed here is
+    // deliberately wrong: the saved one must win, or the run is not the same run.
+    const second = await open(config(llm.baseURL, { persistence }))
+    const { events, onEvent } = collect()
+    const result = await second.run({ input: 'IGNORED', resumeFromRunId: runId, onEvent })
+
+    assert.equal(result.text, 'All three steps done.')
+    assert.deepEqual(
+      result.trace.map((t) => t.step.id),
+      ['s1', 's2', 's3'],
+    )
+    assert.equal(
+      result.trace[0].summary,
+      'did s1',
+      'step one is carried over from the checkpoint, not produced by a second execution',
+    )
+    assert.equal(result.iterations, 3, 'the loop counters carry over')
+
+    // The call log is the proof.
+    assert.equal(llm.requests.filter((r) => stageOf(r) === 'planner').length, 1, 'never re-planned')
+    assert.deepEqual(
+      llm.requests.filter((r) => stageOf(r) === 'executor').map(stepOf),
+      ['s1', 's2', 's3'],
+      'every step ran exactly once across both processes',
+    )
+    assert.ok(
+      !llm.requests.some((r) => userOf(r).includes('IGNORED')),
+      'the saved input drove the resumed run, not the one passed to it',
+    )
+    assert.deepEqual(started, [runId], 'a resumed run does not announce a second start')
+    assert.equal(
+      ofType(events, 'plan.created').length,
+      1,
+      'consumers attaching mid-resume see the plan',
+    )
+    assert.equal(saved.get(runId)?.trace.length, 3, 'the resumed run kept checkpointing')
+  })
+})
+
+test('resume: the per-run caps still apply across the crash', async () => {
+  await withLlm(resumeScript, async ({ llm, open }) => {
+    // Two iterations in total for a three-step plan; one is spent before the crash.
+    const { saved, controller, persistence } = crashingStore(1)
+    const first = await open(config(llm.baseURL, { persistence, maxIterations: 2 }))
+    await assert.rejects(
+      first.run({ input: 'do three things', signal: controller.signal }),
+      /abort/i,
+    )
+    const [runId] = [...saved.keys()]
+
+    const second = await open(config(llm.baseURL, { persistence, maxIterations: 2 }))
+    const result = await second.run({ input: 'unused', resumeFromRunId: runId })
+
+    assert.deepEqual(
+      llm.requests.filter((r) => stageOf(r) === 'executor').map(stepOf),
+      ['s1', 's2'],
+      'only one more step is allowed: the iteration spent before the crash still counts',
+    )
+    assert.equal(result.iterations, 2)
+    assert.equal(result.trace.length, 2)
   })
 })

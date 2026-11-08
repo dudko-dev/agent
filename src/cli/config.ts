@@ -4,11 +4,13 @@ import type {
   ICompactionConfig,
   IMcpServerConfig,
   ITokenLimits,
+  IToolApprovalConfig,
   LogLevel,
   ProviderType,
   ThinkingLevel,
   ThinkingSetting,
   ToolApprovalMode,
+  ToolPermission,
 } from '../index.ts'
 
 const PROVIDERS: readonly ProviderType[] = [
@@ -89,7 +91,7 @@ export const loadConfig = (): IAgentConfig => {
     limits: parseLimits(),
     maxToolCalls: parseOptionalInt(process.env.AGENT_MAX_TOOL_CALLS),
     thinking: parseThinking(process.env.AGENT_THINKING),
-    toolApproval: parseApproval(process.env.AGENT_TOOL_APPROVAL),
+    toolApproval: parseApproval(process.env.AGENT_TOOL_APPROVAL, process.env.AGENT_TOOL_RULES),
     compaction: parseCompaction(),
     llmTimeoutMs: parseOptionalInt(process.env.AGENT_LLM_TIMEOUT_MS),
     llmMaxRetries: parseOptionalInt(process.env.AGENT_LLM_MAX_RETRIES),
@@ -141,15 +143,58 @@ const parseLimits = (): ITokenLimits | undefined => {
   return Object.keys(limits).length ? limits : undefined
 }
 
-const parseApproval = (raw: string | undefined): { mode: ToolApprovalMode } | undefined => {
+const TOOL_PERMISSIONS: readonly ToolPermission[] = ['allow', 'ask', 'deny']
+
+// AGENT_TOOL_RULES: a JSON object mapping tool names (exact, or with '*' globs)
+// to allow | ask | deny, e.g. {"github__delete_*":"deny","docs__*":"allow"}. The
+// most specific match wins (exact beats the longest glob) and it beats the
+// mode, so a rule holds even under autopilot — this is the CLI's counterpart of
+// the permissions block in a settings file. Validated eagerly: a typo such as
+// "dney" silently leaving a destructive tool open is the failure this prevents.
+export const parseToolRules = (
+  raw: string | undefined,
+): Record<string, ToolPermission> | undefined => {
   const v = raw?.trim()
   if (!v) {
     return undefined
   }
-  if (!APPROVAL_MODES.includes(v as ToolApprovalMode)) {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(v)
+  } catch {
+    throw new Error('AGENT_TOOL_RULES must be a JSON object, e.g. {"github__delete_*":"deny"}')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('AGENT_TOOL_RULES must be a JSON object, e.g. {"github__delete_*":"deny"}')
+  }
+  const rules: Record<string, ToolPermission> = {}
+  for (const [pattern, permission] of Object.entries(parsed)) {
+    if (!pattern.trim()) {
+      throw new Error('AGENT_TOOL_RULES: a rule needs a non-empty tool name or pattern')
+    }
+    if (!TOOL_PERMISSIONS.includes(permission as ToolPermission)) {
+      throw new Error(
+        `AGENT_TOOL_RULES["${pattern}"] must be ${TOOL_PERMISSIONS.join(' | ')}, got: ${JSON.stringify(permission)}`,
+      )
+    }
+    rules[pattern] = permission as ToolPermission
+  }
+  return Object.keys(rules).length ? rules : undefined
+}
+
+const parseApproval = (
+  rawMode: string | undefined,
+  rawRules?: string,
+): IToolApprovalConfig | undefined => {
+  const v = rawMode?.trim()
+  if (v && !APPROVAL_MODES.includes(v as ToolApprovalMode)) {
     throw new Error(`AGENT_TOOL_APPROVAL must be ${APPROVAL_MODES.join(' | ')}, got: ${v}`)
   }
-  return { mode: v as ToolApprovalMode }
+  const rules = parseToolRules(rawRules)
+  if (!v && !rules) {
+    return undefined
+  }
+  return { ...(v ? { mode: v as ToolApprovalMode } : {}), ...(rules ? { rules } : {}) }
 }
 
 // AGENT_COMPACTION=off disables automatic compaction (the /compact command
