@@ -48,7 +48,7 @@ export { createToolResultClearer } from './context-editing.ts'
 export type { IClearedInfo, IToolResultClearing } from './context-editing.ts'
 // Subagents
 export { createSubagentTool } from './subagent.ts'
-export type { ISubagentToolOptions, SubagentIsolation } from './subagent.ts'
+export type { ISubagentProfile, ISubagentToolOptions, SubagentIsolation } from './subagent.ts'
 
 export type {
   AgentEvent,

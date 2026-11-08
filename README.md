@@ -406,6 +406,35 @@ Several calls in one model step run in parallel (bounded by `maxConcurrent`). Th
 
 The worker entry ships as `dist/subagent-worker.js` and is resolved next to the bundle, from the ESM and the CJS build alike.
 
+### Profiles: other models, params and context per call
+
+A subagent normally has one fixed configuration. `profiles` lets the **parent model** choose between named variants of it, per call:
+
+```ts
+const researcher = createSubagentTool({
+  name: 'researcher',
+  description: 'Research a question with the docs tools and report the facts',
+  config: { ...cheapConfig }, // the default: a small, quick model
+  profiles: {
+    deep: {
+      description: 'A hard question that needs a thorough, multi-source answer',
+      config: { model: 'a-strong-model', thinking: 'high', maxIterations: 8 },
+    },
+    skeptic: {
+      description: 'Check a claim someone else made; look for what contradicts it',
+      config: { systemPrompt: 'Assume the claim is wrong until the sources show otherwise.' },
+    },
+  },
+})
+```
+
+- The tool gains an optional `profile` argument, an enum of the names; leaving it out runs the base config. Each profile's `description` is appended to the tool's description, so the parent chooses by *when to use it* — write them that way.
+- A profile's `config` is laid **over** the base config, field by field and shallow: a profile's `limits` replaces the base's `limits`, it is not merged into it. Anything in `IAgentConfig` can differ — the model (even another provider), `thinking`, limits, `systemPrompt`, `skills`, `tools`.
+- With `'worker'` isolation a profile's `config` must be structured-cloneable like the base one, and that is checked when the tool is created — not hours into a run, when the profile is first chosen.
+- The choice is bounded by what **you** listed: the parent cannot pick an arbitrary model, so cost stays in your hands. An unknown name is a tool error the model can correct, raised before any child starts or is announced.
+- `subagent.start` carries `profile` when one was chosen. Child tokens are charged to the parent as always, whichever profile ran.
+- The child's context is still just `task`. A different context means a profile that changes `systemPrompt`, `skills` or `tools` — the parent cannot hand a child more of its own conversation.
+
 ## Autonomy
 
 The stage prompts are written for an agent that acts on its own:

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { isMainThread } from 'node:worker_threads'
-import { tool, type ToolSet } from 'ai'
+import { asSchema, tool, type ToolSet } from 'ai'
 import { z } from 'zod'
 import {
   createAgent,
@@ -14,6 +14,7 @@ import {
   type IRunSnapshot,
   type IToolApprovalRequest,
 } from '../src/index.ts'
+import { runContext } from '../src/context.ts'
 import { startLocalMcp } from './helpers/mcp-server.ts'
 import {
   hasToolResult,
@@ -758,6 +759,283 @@ test('subagent (worker): aborting the parent run aborts the child', async () => 
     )
     assert.ok(Date.now() - started < 10_000)
   })
+})
+
+// ── subagent profiles ──────────────────────────────────────────────────────
+// The parent model picks a NAMED way to run the same subagent per call: another
+// model, other params, another context. The proof is the `model` the child's
+// HTTP requests carry — what actually went over the wire — not what an answer says.
+
+type ToolLike = { execute: (input: unknown, options: unknown) => Promise<string> }
+const callTool = (t: unknown, input: unknown) =>
+  (t as ToolLike).execute(input, { toolCallId: 't', messages: [] })
+
+/** A child answers with the name of the model it ran on; the parent delegates twice. */
+const profileScript: Script = (req) => {
+  const stage = stageOf(req)
+  if (req.model === 'parent-model') {
+    if (stage === 'planner') return { text: planJson([{ id: 's1' }]) }
+    if (stage === 'executor') {
+      return hasToolResult(req)
+        ? { text: 'delegated' }
+        : {
+            toolCalls: [
+              { name: 'research', args: { task: 'quick lookup' } },
+              { name: 'research', args: { task: 'hard question', profile: 'deep' } },
+            ],
+          }
+    }
+    return { text: 'parent done' }
+  }
+  if (stage === 'planner') return { text: planJson([{ id: 'c1' }]) }
+  if (stage === 'executor') return { text: `worked on ${req.model}` }
+  return { text: `answer from ${req.model}` }
+}
+
+for (const isolation of ['in-process', 'worker'] as const) {
+  test(`subagent profiles (${isolation}): the parent chooses per call, and the child runs on THAT model`, async () => {
+    await withLlm(profileScript, async ({ llm, open }) => {
+      const researcher = createSubagentTool({
+        name: 'researcher',
+        description: 'Research a question',
+        isolation,
+        config: config(llm.baseURL, { model: 'cheap-model', maxIterations: 2 }),
+        profiles: {
+          deep: {
+            description: 'A strong model for a hard question',
+            config: { model: 'strong-model' },
+          },
+        },
+      })
+      const agent = await open(
+        config(llm.baseURL, { model: 'parent-model', tools: { research: researcher } }),
+      )
+      const { events, onEvent } = collect()
+      const result = await agent.run({ input: 'research two things', onEvent })
+
+      const outputs = result.trace[0].toolCalls.map((c) => c.output)
+      assert.deepEqual(
+        [...outputs].sort(),
+        ['answer from cheap-model', 'answer from strong-model'],
+        JSON.stringify(result.trace[0].toolCalls),
+      )
+
+      // The wire: each child reached only its own model, and each model saw only its own task.
+      const child = llm.requests.filter((r) => r.model !== 'parent-model')
+      assert.deepEqual([...new Set(child.map((r) => r.model))].sort(), [
+        'cheap-model',
+        'strong-model',
+      ])
+      const forModel = (m: string) => child.filter((r) => r.model === m)
+      assert.ok(forModel('strong-model').some((r) => userOf(r).includes('hard question')))
+      assert.ok(forModel('strong-model').every((r) => !userOf(r).includes('quick lookup')))
+      assert.ok(forModel('cheap-model').every((r) => !userOf(r).includes('hard question')))
+
+      const starts = ofType(events, 'subagent.start')
+      assert.equal(starts.length, 2)
+      assert.deepEqual(
+        starts.map((e) => e.profile),
+        starts.map((e) => (e.task === 'hard question' ? 'deep' : undefined)),
+        'the event names the profile that was chosen, and omits it for the default',
+      )
+    })
+  })
+}
+
+test("subagent profiles: a profile changes the child's context, not just its model", async () => {
+  await withLlm(
+    (req) =>
+      stageOf(req) === 'planner'
+        ? { text: planJson([{ id: 'c1' }]) }
+        : stageOf(req) === 'executor'
+          ? { text: 'worked' }
+          : { text: `answer from ${req.model}` },
+    async ({ llm }) => {
+      const analyst = createSubagentTool({
+        name: 'analyst',
+        description: 'Analyse',
+        isolation: 'in-process',
+        config: config(llm.baseURL, { model: 'base-model', systemPrompt: 'BASE-CONTEXT' }),
+        profiles: {
+          careful: {
+            description: 'Slow and careful',
+            config: { model: 'careful-model', systemPrompt: 'CAREFUL-CONTEXT' },
+          },
+        },
+      })
+      assert.equal(await callTool(analyst, { task: 'one' }), 'answer from base-model')
+      assert.equal(
+        await callTool(analyst, { task: 'two', profile: 'careful' }),
+        'answer from careful-model',
+      )
+      const on = (m: string) => llm.requests.filter((r) => r.model === m)
+      assert.ok(on('base-model').length > 0 && on('careful-model').length > 0)
+      assert.ok(
+        on('base-model').every(
+          (r) => systemOf(r).includes('BASE-CONTEXT') && !systemOf(r).includes('CAREFUL-CONTEXT'),
+        ),
+      )
+      assert.ok(on('careful-model').every((r) => systemOf(r).includes('CAREFUL-CONTEXT')))
+    },
+  )
+})
+
+test('subagent profiles: the tool tells the parent what each profile is for; without them it is unchanged', async () => {
+  const withProfiles = createSubagentTool({
+    name: 'r',
+    description: 'Research a question',
+    isolation: 'in-process',
+    config: config('http://unused.test'),
+    profiles: {
+      fast: { description: 'A quick shallow check' },
+      deep: { description: 'A thorough investigation', config: { model: 'big' } },
+    },
+  })
+  const schema = (await asSchema(withProfiles.inputSchema as never).jsonSchema) as {
+    properties: Record<string, { enum?: string[] }>
+    required?: string[]
+  }
+  assert.deepEqual(schema.properties.profile.enum, ['fast', 'deep'])
+  assert.deepEqual(schema.required, ['task'], 'profile stays optional')
+  // The description carries what each is FOR: a prompted-mode model reads the
+  // catalogue, and would never learn what "deep" means from an enum alone.
+  assert.match(String(withProfiles.description), /- fast: A quick shallow check/)
+  assert.match(String(withProfiles.description), /- deep: A thorough investigation/)
+
+  const plain = createSubagentTool({
+    name: 'r',
+    description: 'Research a question',
+    isolation: 'in-process',
+    config: config('http://unused.test'),
+  })
+  const plainSchema = (await asSchema(plain.inputSchema as never).jsonSchema) as {
+    properties: Record<string, unknown>
+  }
+  assert.deepEqual(Object.keys(plainSchema.properties), ['task'])
+  assert.equal(plain.description, 'Research a question')
+})
+
+test('subagent profiles: an unknown name is refused before any child starts', async () => {
+  await withLlm(
+    (req) =>
+      stageOf(req) === 'planner'
+        ? { text: planJson([{ id: 'c1' }]) }
+        : { text: `answer from ${req.model}` },
+    async ({ llm }) => {
+      const r = createSubagentTool({
+        name: 'r',
+        description: 'Research',
+        isolation: 'in-process',
+        config: config(llm.baseURL, { model: 'base-model' }),
+        profiles: { fast: { description: 'Quick' }, deep: { description: 'Slow' } },
+      })
+      // These bypass the schema (a prompted-mode model's call is not validated by
+      // it), so this check is the one that has to hold.
+      for (const bad of ['nope', 'constructor', '__proto__', 'toString']) {
+        await assert.rejects(
+          callTool(r, { task: 'x', profile: bad }),
+          /unknown profile .*choose one of: fast, deep/,
+        )
+      }
+      assert.equal(llm.requests.length, 0, 'no child was started for any of them')
+      // An empty string is what a model sends for "none": it means the default.
+      assert.equal(await callTool(r, { task: 'x', profile: '' }), 'answer from base-model')
+    },
+  )
+})
+
+test('subagent profiles: an unknown name is not announced either — checked where execute itself runs', async () => {
+  // At the agent level the schema's enum rejects a bad name before `execute` is even
+  // reached, so that route cannot tell whether execute validates BEFORE announcing.
+  // Calling it inside a run context, where events are collected, can.
+  await withLlm(
+    () => ({ text: 'unused' }),
+    async ({ llm }) => {
+      const r = createSubagentTool({
+        name: 'r',
+        description: 'Research',
+        isolation: 'in-process',
+        config: config(llm.baseURL, { model: 'base-model' }),
+        profiles: { deep: { description: 'Slow' } },
+      })
+      const { events, onEvent } = collect()
+      const context = { runId: 'r1', startedAt: 0, sandboxDir: '/nonexistent', emit: onEvent }
+      await runContext.run(context, async () => {
+        await assert.rejects(callTool(r, { task: 'x', profile: 'nope' }), /unknown profile "nope"/)
+      })
+      assert.equal(
+        events.length,
+        0,
+        'no start, no error, nothing announced for a call that never began',
+      )
+      assert.equal(llm.requests.length, 0)
+    },
+  )
+})
+
+test('subagent profiles: the parent model is told its mistake, and no delegation is announced', async () => {
+  await withLlm(
+    (req) => {
+      const stage = stageOf(req)
+      if (req.model === 'parent-model') {
+        if (stage === 'planner') return { text: planJson([{ id: 's1' }]) }
+        if (stage === 'executor') {
+          return hasToolResult(req)
+            ? { text: 'noted' }
+            : { toolCalls: [{ name: 'research', args: { task: 'x', profile: 'nope' } }] }
+        }
+        return { text: 'done' }
+      }
+      return { text: 'a child ran' }
+    },
+    async ({ llm, open }) => {
+      const researcher = createSubagentTool({
+        name: 'researcher',
+        description: 'Research',
+        isolation: 'in-process',
+        config: config(llm.baseURL, { model: 'child-model' }),
+        profiles: { deep: { description: 'Slow', config: { model: 'strong-model' } } },
+      })
+      const agent = await open(
+        config(llm.baseURL, { model: 'parent-model', tools: { research: researcher } }),
+      )
+      const { events, onEvent } = collect()
+      await agent.run({ input: 'go', onEvent })
+      assert.ok(
+        !llm.requests.some((r) => r.model !== 'parent-model'),
+        'no child model was ever called',
+      )
+      assert.equal(ofType(events, 'subagent.start').length, 0, 'nothing was announced')
+    },
+  )
+})
+
+test('subagent profiles: a profile that cannot work is refused when the tool is created', () => {
+  const make = (extra: Record<string, unknown>) => () =>
+    createSubagentTool({
+      name: 'r',
+      description: 'd',
+      config: config('http://unused.test'),
+      ...extra,
+    } as never)
+  // A function would otherwise surface only when that profile is first chosen —
+  // possibly hours into a run.
+  assert.throws(
+    make({
+      isolation: 'worker',
+      profiles: { p: { description: 'x', config: { getHeaders: () => ({}) } } },
+    }),
+    /profile "p" config\.getHeaders is a function/,
+  )
+  assert.doesNotThrow(
+    make({
+      isolation: 'in-process',
+      profiles: { p: { description: 'x', config: { getHeaders: () => ({}) } } },
+    }),
+    'in-process has no such limit',
+  )
+  assert.throws(make({ profiles: { p: { description: '  ' } } }), /profile "p" needs a description/)
+  assert.throws(make({ profiles: { ' ': { description: 'x' } } }), /non-empty name/)
 })
 
 // ── resume ─────────────────────────────────────────────────────────────────
