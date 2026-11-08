@@ -78,7 +78,9 @@ export const runRepl = async (): Promise<void> => {
     `[session] maxIterations=${config.maxIterations} maxStepsPerTask=${config.maxStepsPerTask} timeoutMs=${config.llmTimeoutMs ?? 'none'} retries=${config.llmMaxRetries ?? 2}`,
   )
   console.log(
-    `[session] thinking=${describeThinking(config.thinking)} approval=${config.toolApproval?.mode ?? 'autopilot'} skills=${config.skills?.length ?? 0}`,
+    `[session] thinking=${describeThinking(config.thinking)} approval=${config.toolApproval?.mode ?? 'autopilot'}${
+      config.toolApproval?.rules ? ` rules=${Object.keys(config.toolApproval.rules).length}` : ''
+    } skills=${config.skills?.length ?? 0}`,
   )
   console.log(`[mcp]     servers=${mcpNames.length ? mcpNames.join(', ') : '(none)'}`)
   console.log(
