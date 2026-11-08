@@ -12,6 +12,8 @@ import type { AddressInfo } from 'node:net'
  */
 
 export interface IChatRequest {
+  /** The model id the agent asked for — how a test tells two subagent profiles apart on the wire. */
+  model?: string
   stream: boolean
   messages: { role: string; content: unknown; tool_call_id?: string }[]
   tools?: { function?: { name?: string } }[]

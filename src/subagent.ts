@@ -11,6 +11,21 @@ import { clipText, emptyUsage, errorMessage, normalizeUsage } from './utils.ts'
 
 export type SubagentIsolation = 'worker' | 'in-process'
 
+// A named way to run the same subagent. Its `config` is laid OVER the base
+// config, field by field and shallow: a profile's `limits` replaces the base's
+// `limits`, it is not merged into it. The PARENT model picks one per call with
+// the optional `profile` argument; the host decides what each name means - a
+// cheap model for a quick lookup, a strong one with thinking for a hard
+// question, a different system prompt, a narrower tool set.
+export interface ISubagentProfile {
+  // When to pick this profile - shown to the parent model, which chooses by it.
+  description: string
+  // Fields laid over the subagent's `config` (model - even another provider -
+  // thinking, limits, systemPrompt, skills, tools ...). With 'worker' isolation
+  // it must be structured-cloneable, like the base config.
+  config?: Partial<IAgentConfig>
+}
+
 export interface ISubagentToolOptions {
   // Tool name the parent model calls.
   name: string
@@ -36,6 +51,12 @@ export interface ISubagentToolOptions {
   outputMaxChars?: number
   // Mark the tool read-only for tool approval. Default false.
   readOnly?: boolean
+  // Named variants the parent model chooses between per call. The tool gains an
+  // optional `profile` argument (one of these names); leaving it out runs the
+  // base config. The child's context is still just `task` - a profile that
+  // changes `systemPrompt`, `skills` or `tools` is how a child gets a different
+  // one. Without profiles the tool is exactly what it was.
+  profiles?: Record<string, ISubagentProfile>
 }
 
 // ── worker protocol (JSON-cloneable) ─────────────────────────────────────
@@ -259,13 +280,14 @@ interface IChildOutcome {
 
 const runInProcess = async (
   opts: ISubagentToolOptions,
+  config: IAgentConfig,
   task: string,
   signal: AbortSignal,
   onEvent: EventHandler,
 ): Promise<IChildOutcome> => {
-  const tools = { ...(opts.config.tools ?? {}), ...(opts.tools ?? {}) }
+  const tools = { ...(config.tools ?? {}), ...(opts.tools ?? {}) }
   const child = await createAgent(
-    { ...opts.config, ...(Object.keys(tools).length ? { tools } : {}) },
+    { ...config, ...(Object.keys(tools).length ? { tools } : {}) },
     onEvent,
   )
   try {
@@ -278,6 +300,7 @@ const runInProcess = async (
 
 const runInWorker = (
   opts: ISubagentToolOptions,
+  config: IAgentConfig,
   task: string,
   signal: AbortSignal,
   onEvent: EventHandler,
@@ -363,7 +386,7 @@ const runInWorker = (
     worker.postMessage({
       type: 'run',
       task,
-      config: toCloneable(opts.config),
+      config: toCloneable(config),
       proxied: describeTools(hostTools),
     } satisfies ParentToWorkerMessage)
   })
@@ -383,17 +406,73 @@ export const createSubagentTool = (opts: ISubagentToolOptions): Tool => {
   if (isolation === 'worker') {
     assertWorkerSafeConfig(opts.config, `subagent "${opts.name}": config`)
   }
+  const profiles = opts.profiles ?? {}
+  const profileNames = Object.keys(profiles)
+  for (const [pname, p] of Object.entries(profiles)) {
+    if (!pname.trim()) {
+      throw new Error(`subagent "${opts.name}": a profile needs a non-empty name`)
+    }
+    if (!p || typeof p.description !== 'string' || !p.description.trim()) {
+      throw new Error(
+        `subagent "${opts.name}": profile "${pname}" needs a description - the parent model chooses by it`,
+      )
+    }
+    if (isolation === 'worker' && p.config) {
+      // A function in a profile would otherwise surface only when that profile is
+      // first chosen - possibly hours into a run.
+      assertWorkerSafeConfig(
+        p.config as IAgentConfig,
+        `subagent "${opts.name}": profile "${pname}" config`,
+      )
+    }
+  }
+  // An empty value counts as "not given": models do send `profile: ""`.
+  const pickProfile = (name: string | undefined): ISubagentProfile | undefined => {
+    if (!name) {
+      return undefined
+    }
+    // hasOwn, not `in`: a model answering "constructor" must not resolve to Object's.
+    if (!Object.hasOwn(profiles, name)) {
+      throw new Error(
+        `subagent "${opts.name}": unknown profile "${name}" - choose one of: ${profileNames.join(', ')}`,
+      )
+    }
+    return profiles[name]
+  }
   const outputMaxChars = opts.outputMaxChars ?? DEFAULT_OUTPUT_MAX_CHARS
   const sem = createSemaphore(Math.max(1, opts.maxConcurrent ?? DEFAULT_MAX_CONCURRENT))
 
+  // The profiles are described in the tool's DESCRIPTION, not only on the schema
+  // property: a prompted-mode model reads the catalogue and a one-line shape, and
+  // would otherwise never learn what "deep" is for.
+  const description = profileNames.length
+    ? `${opts.description}\n\nOptional \`profile\` (omit it for the default):\n${profileNames
+        .map((n) => `- ${n}: ${profiles[n].description}`)
+        .join('\n')}`
+    : opts.description
+  const taskSchema = z
+    .string()
+    .describe('A complete, self-contained task for the subagent, with all context it needs')
+  const inputSchema = (
+    profileNames.length
+      ? z.object({
+          task: taskSchema,
+          profile: z
+            .enum(profileNames as [string, ...string[]])
+            .optional()
+            .describe("One of this tool's profiles, described above. Omit it for the default."),
+        })
+      : z.object({ task: taskSchema })
+  ) as z.ZodType<{ task: string; profile?: string }>
+
   const subagent = tool({
-    description: opts.description,
-    inputSchema: z.object({
-      task: z
-        .string()
-        .describe('A complete, self-contained task for the subagent, with all context it needs'),
-    }),
-    execute: async ({ task }, { abortSignal }) => {
+    description,
+    inputSchema,
+    execute: async ({ task, profile: profileName }, { abortSignal }) => {
+      // Before taking a slot or announcing a start: an unknown name is a tool error
+      // the model can correct, not a delegation that began and died.
+      const profile = pickProfile(profileName)
+      const config: IAgentConfig = { ...opts.config, ...profile?.config }
       const store = runContext.getStore()
       const emit: EventHandler = store?.emit ?? (() => {})
       const id = randomUUID()
@@ -424,11 +503,17 @@ export const createSubagentTool = (opts: ISubagentToolOptions): Tool => {
         emit({ type: 'subagent.event', id, name, event: slimEvent(event) })
       }
       try {
-        emit({ type: 'subagent.start', id, name, task })
+        emit({
+          type: 'subagent.start',
+          id,
+          name,
+          task,
+          ...(profile ? { profile: profileName } : {}),
+        })
         const out =
           isolation === 'worker'
-            ? await runInWorker(opts, task, ac.signal, onChildEvent)
-            : await runInProcess(opts, task, ac.signal, onChildEvent)
+            ? await runInWorker(opts, config, task, ac.signal, onChildEvent)
+            : await runInProcess(opts, config, task, ac.signal, onChildEvent)
         childUsage = normalizeUsage(out.usage)
         const text = clipText(out.text, outputMaxChars)
         emit({ type: 'subagent.complete', id, name, text, usage: childUsage })

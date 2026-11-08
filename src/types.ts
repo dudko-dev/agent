@@ -502,7 +502,8 @@ type AgentEventBody =
       reason?: string
       automatic: boolean
     }
-  | { type: 'subagent.start'; id: string; name: string; task: string }
+  // `profile` is set when the parent chose one of the subagent's named profiles for this call.
+  | { type: 'subagent.start'; id: string; name: string; task: string; profile?: string }
   // A child event, forwarded verbatim (long strings clipped).
   | { type: 'subagent.event'; id: string; name: string; event: AgentEvent }
   | { type: 'subagent.complete'; id: string; name: string; text: string; usage: IUsage }
