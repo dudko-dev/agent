@@ -42,6 +42,7 @@ Optional env vars (see env.example for the full list):
   AGENT_MAX_TOTAL_TOKENS
   AGENT_MAX_TOOL_CALLS        cap on tool calls per run
   AGENT_TOOL_APPROVAL         autopilot | ask-writes | ask-all | read-only
+  AGENT_TOOL_RULES            JSON: { "<tool or glob*>": "allow" | "ask" | "deny" } - beats the mode
   AGENT_SKILLS_DIR            folder of <skill>/SKILL.md skills
   AGENT_CONTEXT_WINDOW_TOKENS model window (auto-compaction threshold = 50%)
   AGENT_COMPACTION            off disables automatic compaction
