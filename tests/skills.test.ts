@@ -149,6 +149,7 @@ test('load_skill activates the skill in the run and lists its files; read_skill_
     discovered: [],
     activeSkills: [],
     traceSummaryUpTo: 0,
+    userUpdates: [],
   }
   await runContext.run(
     { runId: 'r', startedAt: 0, sandboxDir: '/tmp/x', state, emit: (e) => events.push(e) },

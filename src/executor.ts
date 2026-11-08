@@ -6,7 +6,7 @@ import { stageCallOptions } from './call-options.ts'
 import type { IAgentInternalContext } from './internal.ts'
 import { hasTokenLimits, limitsStopCondition, resolveLimits } from './limits.ts'
 import { effectiveToolStrategy } from './planner.ts'
-import { buildExecutorUserPrompt, composeExecutorSystem } from './prompts.ts'
+import { buildExecutorUserPrompt, composeExecutorSystem, renderUserMessages } from './prompts.ts'
 import { stageEmitsThoughts } from './thinking.ts'
 import { MAX_CARRIED_DISCOVERED_TOOLS } from './tool-search.ts'
 import { ATTR, withSpan } from './tracing.ts'
@@ -256,25 +256,47 @@ const runOnce = async (
         )
       : undefined
   const editMessages = caching.enabled || Boolean(clear)
+  const steered = ctx.takeRoundUpdates
 
   const result = streamText({
     model: ctx.executorModel,
     tools,
     ...(activeTools ? { activeTools } : {}),
-    ...(active || editMessages
+    ...(active || editMessages || steered
       ? {
-          prepareStep: ({ messages }: { messages: ModelMessage[] }) => {
-            const next = withRollingBreakpoint(clear ? clear(messages) : messages, caching)
+          prepareStep: ({
+            messages,
+            stepNumber,
+          }: {
+            messages: ModelMessage[]
+            stepNumber: number
+          }) => {
+            // What the user said since the last round goes in as a user turn after the tool
+            // results (providers fold it into the same turn as the results). A messages
+            // override carries forward to the later rounds, so it is added once.
+            const said = steered && stepNumber > 0 ? steered() : []
+            const base: ModelMessage[] = said.length
+              ? [...messages, { role: 'user', content: renderUserMessages(said) }]
+              : messages
+            const next = withRollingBreakpoint(clear ? clear(base) : base, caching)
             return {
               ...(active ? { activeTools: [...active].filter((name) => name in tools) } : {}),
-              ...(editMessages ? { messages: next } : {}),
+              ...(editMessages || said.length ? { messages: next } : {}),
             }
           },
         }
       : {}),
     stopWhen,
     ...call,
-    prompt: buildExecutorUserPrompt(input, plan, step, trace, history, view),
+    prompt: buildExecutorUserPrompt(
+      input,
+      plan,
+      step,
+      trace,
+      history,
+      view,
+      run?.userUpdates.map((u) => u.text),
+    ),
     abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
   })
 

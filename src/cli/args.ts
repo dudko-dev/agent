@@ -50,6 +50,8 @@ Optional env vars (see env.example for the full list):
 Commands inside the REPL:
   /status, /tools, /history, /reset, /reconnect, /exit
   /compact                    summarise the conversation history now
+  /agents, /stop [n]          while a run goes: list running subagents / stop one (the run goes on);
+                              any other text you type then is said to the running agent
   /autopilot                  toggle autopilot (no tool approval prompts)
   /approval <mode>            autopilot | ask-writes | ask-all | read-only
 

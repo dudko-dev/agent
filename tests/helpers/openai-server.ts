@@ -28,6 +28,8 @@ export interface IScriptedReply {
   toolCalls?: { name: string; args: unknown }[]
   /** Streamed first as `reasoning_content` deltas (the model's thoughts). */
   reasoning?: string
+  /** Hold the answer this long (a slow model, to act mid-run). */
+  delayMs?: number
   /** Usage to report instead of the default 10 in / 5 out. */
   usage?: { prompt?: number; completion?: number; cached?: number; reasoning?: number }
 }
@@ -183,16 +185,23 @@ export const startLocalOpenAI = async (script: Script): Promise<ILocalOpenAI> =>
       const parsed = JSON.parse(Buffer.concat(chunks).toString() || '{}') as IChatRequest
       requests.push(parsed)
       const reply = script(parsed)
-      if (parsed.stream) {
-        res.writeHead(200, {
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
-          connection: 'keep-alive',
-        })
-        res.end(streamBody(reply))
+      const answer = (): void => {
+        if (parsed.stream) {
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            connection: 'keep-alive',
+          })
+          res.end(streamBody(reply))
+        } else {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(jsonBody(reply))
+        }
+      }
+      if (reply.delayMs) {
+        setTimeout(answer, reply.delayMs)
       } else {
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(jsonBody(reply))
+        answer()
       }
     })
   })

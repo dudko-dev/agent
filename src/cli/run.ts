@@ -4,13 +4,15 @@ import type {
   AgentEvent,
   IConversationTurn,
   IToolApprovalRequest,
+  RunControl,
   ThinkingSetting,
   ToolApprovalDecision,
   ToolApprovalMode,
 } from '../index.ts'
-import { createAgent, loadSkillsFromDir } from '../index.ts'
+import { createAgent, createRunControl, loadSkillsFromDir } from '../index.ts'
 import { isSummaryTurn } from '../compaction.ts'
 import { loadConfig, skillsDirFromEnv } from './config.ts'
+import { describeSubagents, parseLiveLine, resolveSubagent, shortId } from './live.ts'
 
 const HISTORY_LIMIT = 16
 const APPROVAL_MODES: readonly ToolApprovalMode[] = [
@@ -89,6 +91,8 @@ export const runRepl = async (): Promise<void> => {
 
   // Which stream (if any) currently owns the output line.
   let streaming: 'none' | 'thought' | 'reasoning' | 'final' = 'none'
+  // What the user said to the agent mid-run that it has shown the model (for the history).
+  const deliveredNow: string[] = []
   const endLine = (): void => {
     if (streaming !== 'none') {
       process.stdout.write(streaming === 'reasoning' ? `${UNDIM}\n` : '\n')
@@ -179,8 +183,28 @@ export const runRepl = async (): Promise<void> => {
         break
       case 'subagent.start':
         endLine()
-        console.log(`  >> subagent ${event.name}: ${truncate(event.task, 160)}`)
+        console.log(
+          `  >> subagent ${event.name} ${shortId(event.id)}${event.profile ? ` [${event.profile}]` : ''}: ${truncate(event.task, 160)}`,
+        )
         break
+      case 'subagent.event': {
+        // The child's own log, tagged so parallel children can be told apart (and stopped).
+        const child = event.event
+        const tag = `${event.name} ${shortId(event.id)}`
+        if (child.type === 'step.start') {
+          endLine()
+          console.log(
+            `     [${tag}] step ${child.index + 1}: ${truncate(child.step.description, 120)}`,
+          )
+        } else if (child.type === 'step.tool-call') {
+          endLine()
+          console.log(`     [${tag}] -> ${child.name} ${formatJson(child.input)}`)
+        } else if (child.type === 'step.tool-result') {
+          endLine()
+          console.log(`     [${tag}] <- ${child.name} ${child.ok ? 'ok' : 'fail'}`)
+        }
+        break
+      }
       case 'subagent.complete':
         endLine()
         console.log(
@@ -189,7 +213,22 @@ export const runRepl = async (): Promise<void> => {
         break
       case 'subagent.error':
         endLine()
-        console.log(`  << subagent ${event.name} failed: ${event.error}`)
+        console.log(
+          event.stopped
+            ? `  << subagent ${event.name} ${shortId(event.id)} stopped by you`
+            : `  << subagent ${event.name} failed: ${event.error}`,
+        )
+        break
+      case 'message.queued':
+        endLine()
+        console.log(
+          `[you->agent] queued, the agent sees it at its next boundary: ${truncate(event.text, 160)}`,
+        )
+        break
+      case 'message.delivered':
+        endLine()
+        console.log(`[you->agent] delivered (${event.at}): ${truncate(event.text, 160)}`)
+        deliveredNow.push(event.text)
         break
       case 'step.complete':
         endLine()
@@ -198,7 +237,7 @@ export const runRepl = async (): Promise<void> => {
         )
         break
       case 'replan.decision':
-        if (event.mode !== 'continue') {
+        if (event.mode !== 'continue' || event.cause === 'user-message') {
           endLine()
           console.log(`[replan]  ${event.mode} (${event.cause}): ${event.reason}`)
         }
@@ -259,6 +298,10 @@ export const runRepl = async (): Promise<void> => {
   const rl = createInterface({ input, output })
   let runController: AbortController | null = null
   let inputController: AbortController | null = null
+  // The run in flight, so a line typed meanwhile can reach it.
+  let control: RunControl | null = null
+  // Said too late for a run (or just as it ended): sent as the next prompt.
+  let followUp: string | undefined
 
   // Approval prompts go through the REPL's readline. Parallel tool calls
   // would otherwise interleave questions, so they are asked one at a time.
@@ -336,22 +379,74 @@ export const runRepl = async (): Promise<void> => {
   // to the same handler (only one of the two ever fires for a keypress).
   rl.on('SIGINT', onSigInt)
 
+  // A line typed while a run goes: text is said TO the agent (it sees it at its next
+  // boundary, and the replanner re-checks the plan); /agents and /stop steer subagents.
+  // While an approval question is open readline hands the line to that question instead.
+  const onLiveLine = (line: string): void => {
+    const live = parseLiveLine(line)
+    switch (live.kind) {
+      case 'ignore':
+        return
+      case 'hint':
+        endLine()
+        console.log(
+          '[hint]    commands work between runs. During a run: type text to tell the agent something, /agents, /stop <n>, Ctrl-C to cancel',
+        )
+        return
+      case 'agents': {
+        endLine()
+        const running = control?.subagents() ?? []
+        console.log(running.length ? '[agents]' : '[agents]  (none running)')
+        for (const row of describeSubagents(running)) {
+          console.log(row)
+        }
+        return
+      }
+      case 'stop': {
+        endLine()
+        const picked = resolveSubagent(control?.subagents() ?? [], live.target)
+        if (typeof picked === 'string') {
+          console.log(`[stop]    ${picked}`)
+        } else if (control?.stopSubagent(picked.id)) {
+          console.log(`[stop]    stopping ${picked.name} ${shortId(picked.id)}...`)
+        } else {
+          console.log(`[stop]    ${picked.name} ${shortId(picked.id)} already finished`)
+        }
+        return
+      }
+      case 'say':
+        // The run may have ended a moment ago: then it is simply the next prompt.
+        if (!control?.send(live.text)) {
+          followUp = followUp ? `${followUp}\n\n${live.text}` : live.text
+        }
+        return
+    }
+  }
+
   try {
     while (true) {
       let prompt: string
-      inputController = new AbortController()
-      try {
-        prompt = (await rl.question('\nyou> ', { signal: inputController.signal })).trim()
-        sigIntCount = 0
-      } catch (err) {
-        if ((err as { name?: string })?.name === 'AbortError') {
-          // Ctrl-C at the prompt is the canonical way out of the REPL.
+      if (followUp !== undefined) {
+        prompt = followUp
+        followUp = undefined
+        console.log(
+          `\n[follow-up] sending what the last run never showed the agent: ${truncate(prompt, 200)}`,
+        )
+      } else {
+        inputController = new AbortController()
+        try {
+          prompt = (await rl.question('\nyou> ', { signal: inputController.signal })).trim()
+          sigIntCount = 0
+        } catch (err) {
+          if ((err as { name?: string })?.name === 'AbortError') {
+            // Ctrl-C at the prompt is the canonical way out of the REPL.
+            break
+          }
+          // Any other rejection (e.g. stdin EOF) - bail out the same way.
           break
+        } finally {
+          inputController = null
         }
-        // Any other rejection (e.g. stdin EOF) - bail out the same way.
-        break
-      } finally {
-        inputController = null
       }
       if (!prompt) {
         continue
@@ -452,6 +547,10 @@ export const runRepl = async (): Promise<void> => {
         }
         continue
       }
+      if (prompt === '/agents') {
+        console.log('[agents]  (none running - subagents show here while a run goes)')
+        continue
+      }
       if (prompt === '/reconnect') {
         try {
           await agent.reconnect()
@@ -469,18 +568,32 @@ export const runRepl = async (): Promise<void> => {
 
       streaming = 'none'
       runController = new AbortController()
+      control = createRunControl()
+      deliveredNow.length = 0
+      rl.on('line', onLiveLine)
       try {
         const result = await agent.run({
           input: prompt,
           history,
           signal: runController.signal,
+          control,
         })
         sigIntCount = 0
+        // Said while the answer was being written: nothing showed it to the model.
+        if (result.undelivered?.length) {
+          followUp = followUp
+            ? `${followUp}\n\n${result.undelivered.join('\n\n')}`
+            : result.undelivered.join('\n\n')
+        }
         // The run compacted the history it was given: keep the compacted copy.
         if (result.compactedHistory) {
           history.splice(0, history.length, ...result.compactedHistory)
         }
         history.push({ role: 'user', content: prompt })
+        // What the user added mid-run, in the order the agent got it.
+        for (const said of deliveredNow) {
+          history.push({ role: 'user', content: said })
+        }
         history.push({ role: 'assistant', content: result.text })
         trimHistory(history)
         const u = result.usage
@@ -495,7 +608,18 @@ export const runRepl = async (): Promise<void> => {
         } else {
           console.error('[error]', (err as Error).message)
         }
+        // A run that ends in an error cannot return `undelivered`; the control still has it.
+        // After a cancel nothing is sent behind the user's back - they are shown instead.
+        const left = control?.pending() ?? []
+        if (left.length) {
+          console.log(`[not delivered] ${left.length} message(s) the agent never saw:`)
+          for (const text of left) {
+            console.log(`  - ${truncate(text, 200)}`)
+          }
+        }
       } finally {
+        rl.off('line', onLiveLine)
+        control = null
         runController = null
       }
     }

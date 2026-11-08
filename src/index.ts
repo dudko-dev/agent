@@ -47,6 +47,9 @@ export { buildInstructions, resolvePromptCaching, withRollingBreakpoint } from '
 export { createToolResultClearer } from './context-editing.ts'
 export type { IClearedInfo, IToolResultClearing } from './context-editing.ts'
 // Subagents
+// Steer a run while it goes: send a message, stop one subagent.
+export { createRunControl } from './control.ts'
+export type { RunControl, SubagentInfo } from './control.ts'
 export { createSubagentTool } from './subagent.ts'
 export type { ISubagentProfile, ISubagentToolOptions, SubagentIsolation } from './subagent.ts'
 

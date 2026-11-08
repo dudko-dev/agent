@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import type { RunControlPort } from './control.ts'
 import type { IRunState } from './internal.ts'
 import type { EventHandler, IPlanStep } from './types.ts'
 
@@ -18,6 +19,9 @@ export interface IRunContext {
   // Mutable per-run state shared with the tool wrappers (usage, tool-call
   // count, discovered tools, active skills).
   state?: IRunState
+  // The run's control, when the host passed one: subagents register here so they
+  // can be listed and stopped.
+  control?: RunControlPort
 }
 
 // Per-run context. Propagates through awaits, so any code reachable from
