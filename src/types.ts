@@ -1,6 +1,7 @@
 import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js'
 import type { ToolSet } from 'ai'
+import type { RunControl } from './control.ts'
 
 export type ProviderType =
   | 'openai'
@@ -430,7 +431,9 @@ export interface IStepResult {
 export type ReplanTrigger =
   'failure' | 'always' | ((result: IStepResult) => boolean | Promise<boolean>)
 
-export type ReplanCause = 'last-step' | 'clean-step' | 'llm-decision'
+// 'user-message': the replanner ran because the user sent a message mid-run (RunControl.send),
+// not because a step failed or the replan trigger fired.
+export type ReplanCause = 'last-step' | 'clean-step' | 'llm-decision' | 'user-message'
 
 // Phase of a `usage` event. 'compact' is a compaction summary call;
 // 'subagent' is usage a subagent tool spent (it counts against this run's
@@ -507,7 +510,16 @@ type AgentEventBody =
   // A child event, forwarded verbatim (long strings clipped).
   | { type: 'subagent.event'; id: string; name: string; event: AgentEvent }
   | { type: 'subagent.complete'; id: string; name: string; text: string; usage: IUsage }
-  | { type: 'subagent.error'; id: string; name: string; error: string }
+  // `stopped` is set when the user stopped this subagent (RunControl.stopSubagent), as
+  // opposed to it failing.
+  | { type: 'subagent.error'; id: string; name: string; error: string; stopped?: boolean }
+  // A message sent with RunControl.send is waiting for the next boundary.
+  | { type: 'message.queued'; id: string; text: string }
+  // The message reached the model. 'round' = between tool-calling rounds inside a step, so
+  // the rest of that step can act on it (the replanner weighs it at the end of the step);
+  // 'step' = at a step boundary, where it forces the replanner to look at the plan;
+  // 'final' = just before the answer is written.
+  | { type: 'message.delivered'; id: string; text: string; at: 'round' | 'step' | 'final' }
   | { type: 'revisions.exceeded'; cap: number }
   | { type: 'error'; error: Error; phase: 'plan' | 'execute' | 'replan' | 'synthesize' | 'init' }
 
@@ -543,6 +555,10 @@ export interface IAgentRunOptions {
   // counters; the saved sandbox dir is recreated lazily but its prior
   // contents are gone unless keepSandbox was true on the original run.
   resumeFromRunId?: string
+  // Steer the run while it goes: control.send(text) puts a message in front of the model at
+  // the next boundary, control.stopSubagent(id) stops one subagent. Make it with
+  // createRunControl(); one control per run.
+  control?: RunControl
 }
 
 export interface IAgentRunResult {
@@ -554,6 +570,10 @@ export interface IAgentRunResult {
   // Set when the run compacted the history it was given (the caller's array
   // is never mutated). Persist it in place of the old history.
   compactedHistory?: IConversationTurn[]
+  // Set when the run was given a `control`: the messages sent with it that the run never got
+  // to show the model (they arrived while the answer was being written). Send them as the
+  // next run. A run that throws (abort, failure) cannot return it - read control.pending().
+  undelivered?: string[]
 }
 
 // Snapshot of a run handed to IPersistence hooks. Each hook receives the
@@ -595,6 +615,10 @@ export interface IRunSnapshot {
   activeSkills?: string[]
   // Tool calls made so far (counts against maxToolCalls on resume).
   toolCallCount?: number
+  // What the user said while the run was going (RunControl.send), in order, and whether the
+  // replanner has already weighed each. A resumed run keeps them: otherwise it would forget a
+  // correction the user had already made.
+  userUpdates?: { text: string; reconciled: boolean }[]
 }
 
 // Optional persistence facade. Write hooks fire at run start, after each

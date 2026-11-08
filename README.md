@@ -103,6 +103,7 @@ Pass an event handler as the second argument to `createAgent`, or per run via `o
 | `tools.discovered` | `find_tools` activated tools (`query`, `names`). |
 | `tool.approval-requested` / `tool.approval-resolved` | The approval gate asked / decided (`automatic` for rule, mode and timeout denials). |
 | `subagent.start` / `subagent.event` / `subagent.complete` / `subagent.error` | A subagent tool call's lifecycle and its forwarded child events. |
+| `message.queued` / `message.delivered` | A `RunControl.send()` message is waiting for a boundary / the model has seen it (`at: 'round' \| 'step' \| 'final'`). See [Steering a run](#steering-a-run-that-is-already-going). |
 | `usage` | Per LLM call; `phase` is `'plan' \| 'execute' \| 'replan' \| 'synthesize' \| 'compact' \| 'subagent'`. |
 
 ```ts
@@ -435,6 +436,63 @@ const researcher = createSubagentTool({
 - `subagent.start` carries `profile` when one was chosen. Child tokens are charged to the parent as always, whichever profile ran.
 - The child's context is still just `task`. A different context means a profile that changes `systemPrompt`, `skills` or `tools` — the parent cannot hand a child more of its own conversation.
 
+## Steering a run that is already going
+
+`run()` takes one input and resolves when the run is over. To say something in the meantime
+("use the staging database", "skip the report") or to stop one subagent out of several, make a
+`RunControl` and pass it to the run:
+
+```ts
+import { createAgent, createRunControl } from '@dudko.dev/agent'
+
+const control = createRunControl()
+const running = agent.run({ input: 'Triage the new tickets', control, onEvent })
+
+control.send('Ignore anything older than a week') // any time while it runs
+control.subagents() // [{ id, name, task, profile?, startedAt }] - who is running now
+control.stopSubagent(id) // stops that one; the run goes on
+const result = await running
+result.undelivered // messages the run never got to show the model - send them as the next run
+```
+
+A message is **not an interrupt**. The run never cuts a tool call short (it may be a write); the
+message waits for the next boundary and is then shown to the model:
+
+| It arrives... | It is shown... | `message.delivered` `at` |
+| --- | --- | --- |
+| during a step, while tools are being called | to the executor on its **next round** of that step, as a user turn after the tool results | `round` |
+| between steps | to the **replanner**, and to every later step | `step` |
+| after the last step, before the answer is written | to the synthesizer | `final` |
+| while the answer is being written, or after the run ended | to **nobody** - it comes back in `result.undelivered` | - |
+
+- **A message always makes the replanner look at the plan again**, at the end of the step it was
+  delivered in - also after the *last* planned step, where it may add work: a plan made before the
+  user spoke may no longer be the right one. That call (`replan.decision` with
+  `cause: 'user-message'`) ignores `maxRevisions`, a revise it makes is not counted against it, and
+  `replanAfter` does not matter. It costs one extra model call per boundary, not per message, and
+  there is no cap on messages. It does need an iteration left (`maxIterations`); without one the
+  message still reaches the synthesizer. A replanner that says `finish` ends the run early - that
+  is how "stop, that is enough" works.
+- Every later stage sees what the user said (a "Messages from the user" block in its prompt), so a
+  correction is not forgotten two steps later - also on an executor retry. Run snapshots carry it
+  (`userUpdates`), so a resumed run still knows it. Prompts of a run **without** a control are
+  byte-for-byte what they were.
+- A message sent **before** the run starts is queued and announced (`message.queued`) when it
+  starts. `send()` returns `false` for an empty text and once the run is over; it never throws.
+- An aborted or failed run **throws**, so it cannot return `undelivered`: read
+  `control.pending()` - it keeps reporting what the run never delivered until the control serves
+  another run (which then starts clean).
+- Use one control per run. A hand-made object in its place is refused: only the ones
+  `createRunControl()` makes are read.
+
+**Stopping a subagent.** `stopSubagent(id)` aborts that child (and its worker thread, if it has
+one). Its delegation fails with a message the parent model can route around ("stopped by the user
+... carry on without its result"), `subagent.error` carries `stopped: true`, and sibling subagents
+and the run are untouched. Only a child that has started is listed; one still waiting for a
+`maxConcurrent` slot is not. A child's own subagents are not individually stoppable - stopping the
+child stops them with it. What each child does is the `subagent.event` stream, the same events the
+parent emits.
+
 ## Autonomy
 
 The stage prompts are written for an agent that acts on its own:
@@ -568,9 +626,11 @@ The package ships a REPL CLI as `dd-agent`. After install, npm makes it availabl
 dd-agent --env-file=.env
 ```
 
-`--env-file=<path>` is loaded via Node's built-in `process.loadEnvFile`, so no `dotenv` dependency is needed. Without the flag the CLI reads the ambient process env. `-h` / `--help` prints the supported flags and the in-REPL slash commands (`/status`, `/tools`, `/history`, `/reset`, `/compact`, `/autopilot`, `/approval <mode>`, `/reconnect`, `/exit`).
+`--env-file=<path>` is loaded via Node's built-in `process.loadEnvFile`, so no `dotenv` dependency is needed. Without the flag the CLI reads the ambient process env. `-h` / `--help` prints the supported flags and the in-REPL slash commands (`/status`, `/tools`, `/history`, `/reset`, `/compact`, `/autopilot`, `/approval <mode>`, `/reconnect`, `/agents`, `/stop`, `/exit`).
 
 The newer features are env-driven too: `AGENT_THINKING` (`off | minimal | low | medium | high | xhigh | <budget tokens>`), `AGENT_MAX_INPUT_TOKENS` / `AGENT_MAX_OUTPUT_TOKENS` / `AGENT_MAX_REASONING_TOKENS` / `AGENT_MAX_TOTAL_TOKENS`, `AGENT_MAX_TOOL_CALLS`, `AGENT_TOOL_APPROVAL` (`autopilot | ask-writes | ask-all | read-only`), `AGENT_TOOL_RULES` (JSON `{ "<tool or glob*>": "allow" | "ask" | "deny" }`, beats the mode — e.g. `{"github__delete_*":"deny"}`), `AGENT_SKILLS_DIR`, `AGENT_TOOL_SELECTION_STRATEGY` (`auto | all | plan-narrowed | search`), `AGENT_CONTEXT_WINDOW_TOKENS` and `AGENT_COMPACTION=off`. The REPL prints the model's thoughts dimmed, auto-compacts its history with the same settings, and — when the approval mode asks — prompts `allow? [y]es / [n]o / [a]lways` right in the terminal; `/autopilot` toggles between autopilot and the last asking mode.
+
+**Talking to the agent while it works.** The REPL keeps reading while a run goes. Text you type then is said to the running agent (it sees it at its next boundary and the replanner re-checks the plan — see [Steering a run](#steering-a-run-that-is-already-going)): the REPL prints `[you->agent] queued` and then `delivered (round|step|final)`, and the message enters the history as a user turn. A message that arrives while the answer is being written is sent as the next prompt (`[follow-up]`). After Ctrl-C nothing is sent behind your back: what the agent never saw is listed as `[not delivered]`. While a run goes, `/agents` lists the running subagents and `/stop <n>` (or an id prefix, or just `/stop` when one runs) stops one — the run goes on; the other REPL commands work between runs. Each subagent's own steps and tool calls are logged as `[name id] ...` lines, so parallel ones can be told apart.
 
 For local development against the source tree:
 

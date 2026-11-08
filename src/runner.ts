@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { compactionMaxTokens } from './call-options.ts'
 import { compactHistory, estimateTokens, resolveCompaction, summarizeTrace } from './compaction.ts'
+import { portOf, type RunControlPort } from './control.ts'
 import { runContext } from './context.ts'
 import { executeStep } from './executor.ts'
 import { checkLimits, resolveLimits } from './limits.ts'
@@ -193,6 +194,8 @@ export const runAgentLoop = async (
   ctx: IAgentInternalContext,
   options: IAgentRunOptions,
 ): Promise<IAgentRunResult> => {
+  // Before anything is spent: a hand-made object in place of createRunControl() is refused.
+  const port = portOf(options.control)
   const resumed = await resolveResume(ctx, options)
   const runId = resumed?.runId ?? randomUUID()
   // Belt-and-braces: resolveResume already validates resumed.runId, but the
@@ -202,34 +205,44 @@ export const runAgentLoop = async (
   assertSafeRunId(runId, 'runId')
   const startedAt = resumed?.startedAt ?? Date.now()
   const sandboxDir = resolveSandboxDir(ctx, runId)
-  return runContext.run({ runId, startedAt, sandboxDir }, async () => {
-    return withSpan(
-      'agent.run',
-      {
-        [ATTR.RUN_ID]: runId,
-        [ATTR.PROVIDER]: ctx.config.providerType,
-        [ATTR.MODEL]: ctx.config.model,
-      },
-      async (span) => {
-        try {
-          const result = await runAgentLoopInner(ctx, options, resumed)
-          span.setAttribute(ATTR.ITERATIONS, result.iterations)
-          span.setAttribute(ATTR.USAGE_TOTAL_TOKENS, result.usage.totalTokens)
-          span.setAttribute(ATTR.USAGE_INPUT_TOKENS, result.usage.inputTokens)
-          span.setAttribute(ATTR.USAGE_OUTPUT_TOKENS, result.usage.outputTokens)
-          return result
-        } finally {
-          // Best-effort cleanup. If the run never wrote anything, rm with
-          // force:true is a no-op; if it did, we drop the whole subtree. The
-          // catch is intentional - we'd rather leak a temp dir than throw on
-          // teardown and mask the real run result.
-          if (!ctx.config.keepSandbox) {
-            await rm(sandboxDir, { recursive: true, force: true }).catch(() => {})
+  return runContext.run(
+    { runId, startedAt, sandboxDir, ...(port ? { control: port } : {}) },
+    async () => {
+      return withSpan(
+        'agent.run',
+        {
+          [ATTR.RUN_ID]: runId,
+          [ATTR.PROVIDER]: ctx.config.providerType,
+          [ATTR.MODEL]: ctx.config.model,
+        },
+        async (span) => {
+          try {
+            const result = await runAgentLoopInner(ctx, options, resumed, port)
+            // The run is over: what it never showed the model goes back to the host.
+            if (port) {
+              result.undelivered = port.detach()
+            }
+            span.setAttribute(ATTR.ITERATIONS, result.iterations)
+            span.setAttribute(ATTR.USAGE_TOTAL_TOKENS, result.usage.totalTokens)
+            span.setAttribute(ATTR.USAGE_INPUT_TOKENS, result.usage.inputTokens)
+            span.setAttribute(ATTR.USAGE_OUTPUT_TOKENS, result.usage.outputTokens)
+            return result
+          } finally {
+            // A run that threw cannot return `undelivered`; detaching here makes control.send
+            // refuse from now on and leaves the leftovers readable through control.pending().
+            port?.detach()
+            // Best-effort cleanup. If the run never wrote anything, rm with
+            // force:true is a no-op; if it did, we drop the whole subtree. The
+            // catch is intentional - we'd rather leak a temp dir than throw on
+            // teardown and mask the real run result.
+            if (!ctx.config.keepSandbox) {
+              await rm(sandboxDir, { recursive: true, force: true }).catch(() => {})
+            }
           }
-        }
-      },
-    )
-  })
+        },
+      )
+    },
+  )
 }
 
 // The run's effective tool strategy: 'auto' resolved against the live
@@ -243,6 +256,7 @@ const runAgentLoopInner = async (
   ctx: IAgentInternalContext,
   options: IAgentRunOptions,
   resumed: IRunSnapshot | undefined,
+  port: RunControlPort | undefined,
 ): Promise<IAgentRunResult> => {
   const { signal } = options
   // On resume the saved input wins so the resumed run prompts the planner /
@@ -277,6 +291,7 @@ const runAgentLoopInner = async (
     activeSkills: [...(resumed?.activeSkills ?? [])],
     traceSummary: resumed?.traceSummary,
     traceSummaryUpTo: resumed?.traceSummaryUpTo ?? 0,
+    userUpdates: (resumed?.userUpdates ?? []).map((u) => ({ ...u })),
   }
 
   // proxiedCtx must be in scope BEFORE callPersistence so the persistence
@@ -302,6 +317,24 @@ const runAgentLoopInner = async (
   if (store) {
     store.emit = proxiedCtx.emit
     store.state = state
+  }
+  // From here a `send` is announced as it comes (and anything sent earlier, now).
+  port?.attach(proxiedCtx.emit)
+  // Take what the user sent since the last boundary and hand it to the model: recorded (a
+  // resume keeps it), announced, returned as texts.
+  const deliver = (at: 'round' | 'step' | 'final'): string[] => {
+    if (!port) {
+      return []
+    }
+    const taken = port.drain()
+    for (const m of taken) {
+      state.userUpdates.push({ text: m.text, reconciled: false })
+      proxiedCtx.emit({ type: 'message.delivered', id: m.id, text: m.text, at })
+    }
+    return taken.map((m) => m.text)
+  }
+  if (port) {
+    proxiedCtx.takeRoundUpdates = () => deliver('round')
   }
   const activate = (name: string, by: 'plan' | 'tool'): void => {
     activateSkill(ctx.skills ?? [], name, by, state, proxiedCtx.emit)
@@ -517,6 +550,7 @@ const runAgentLoopInner = async (
       : {}),
     ...(state.activeSkills.length ? { activeSkills: [...state.activeSkills] } : {}),
     ...(state.toolCalls ? { toolCallCount: state.toolCalls } : {}),
+    ...(state.userUpdates.length ? { userUpdates: state.userUpdates.map((u) => ({ ...u })) } : {}),
     ...extra,
   })
 
@@ -631,10 +665,18 @@ const runAgentLoopInner = async (
       break
     }
 
+    // A message from the user forces the replanner, whatever the trigger: a plan made
+    // before the user spoke may no longer be the right one. That call ignores
+    // maxRevisions and is not counted against it; it still needs an iteration left to
+    // act on a revised plan (maxIterations).
+    deliver('step')
+    const freshUpdates = state.userUpdates.filter((u) => !u.reconciled).length
+    const byUser = freshUpdates > 0 && iterations < ctx.config.maxIterations && !signal?.aborted
+
     const nextStep = currentPlan.steps[stepIndex + 1] ?? null
     const isLastPlannedStep = nextStep === null
 
-    if (isLastPlannedStep) {
+    if (isLastPlannedStep && !byUser) {
       proxiedCtx.emit({
         type: 'replan.decision',
         mode: 'finish',
@@ -647,16 +689,18 @@ const runAgentLoopInner = async (
     // The trigger is host-configurable (replanAfter); a predicate is bounded
     // by the same watchdog/abort as an LLM call and falls back to the
     // 'failure' rule on error, so it can never stall the run.
-    const wantReplanner = await replanTriggered(ctx.config.replanAfter, result, {
-      signal,
-      timeoutMs: ctx.config.llmTimeoutMs ?? 0,
-      onError: (err) =>
-        proxiedCtx.emit({
-          type: 'log',
-          level: 'warn',
-          message: `[runner] replanAfter predicate threw - using the failure rule: ${(err as Error).message}`,
-        }),
-    })
+    const wantReplanner =
+      byUser ||
+      (await replanTriggered(ctx.config.replanAfter, result, {
+        signal,
+        timeoutMs: ctx.config.llmTimeoutMs ?? 0,
+        onError: (err) =>
+          proxiedCtx.emit({
+            type: 'log',
+            level: 'warn',
+            message: `[runner] replanAfter predicate threw - using the failure rule: ${(err as Error).message}`,
+          }),
+      }))
     if (!wantReplanner) {
       proxiedCtx.emit({
         type: 'replan.decision',
@@ -672,7 +716,15 @@ const runAgentLoopInner = async (
     let decision
     try {
       await maybeCompactTrace(trace)
-      decision = await decideNextAction(input, currentPlan, trace, nextStep, proxiedCtx, signal)
+      decision = await decideNextAction(
+        input,
+        currentPlan,
+        trace,
+        nextStep,
+        proxiedCtx,
+        signal,
+        freshUpdates,
+      )
     } catch (err) {
       proxiedCtx.emit({ type: 'error', error: asError(err), phase: 'replan' })
       await callPersistence(
@@ -688,18 +740,24 @@ const runAgentLoopInner = async (
       type: 'replan.decision',
       mode: decision.mode,
       reason: decision.reason,
-      cause: 'llm-decision',
+      cause: byUser ? 'user-message' : 'llm-decision',
     })
+    // Weighed, whatever it decided: from here the messages are part of the run's story.
+    for (const u of state.userUpdates) {
+      u.reconciled = true
+    }
 
     if (decision.mode === 'finish') {
       break
     }
     if (decision.mode === 'revise') {
-      if (revisions >= maxRevisions) {
+      if (!byUser && revisions >= maxRevisions) {
         proxiedCtx.emit({ type: 'revisions.exceeded', cap: maxRevisions })
         break
       }
-      revisions++
+      if (!byUser) {
+        revisions++
+      }
       currentPlan = reviseInto(proxiedCtx, decision.newPlan)
       proxiedCtx.emit({ type: 'plan.revised', plan: currentPlan, reason: decision.reason })
       for (const name of currentPlan.skills ?? []) {
@@ -709,12 +767,18 @@ const runAgentLoopInner = async (
       await persistCheckpoint()
       continue
     }
+    if (isLastPlannedStep) {
+      // Forced by a message, and the replanner found nothing to add: nothing left to run.
+      break
+    }
     stepIndex++
     await persistCheckpoint()
   }
 
   let text: string
   try {
+    // Last chance to be heard before the answer is written.
+    deliver('final')
     await maybeCompactTrace(trace)
     text = await synthesizeAnswer(input, currentPlan, trace, history, proxiedCtx, signal)
   } catch (err) {

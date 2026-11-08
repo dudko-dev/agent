@@ -293,6 +293,38 @@ export const composeExecutorSystem = (
     : '') +
   activeSkillsSection(parts.skills, parts.activeSkills)
 
+const quoted = (text: string): string => text.trim().replace(/\n/g, '\n  ')
+
+// What the user said while the run was going, for a stage prompt. `fresh` = how many of the
+// last ones the stage is meeting for the first time. Empty - and so absent from the prompt -
+// unless the user actually sent something, so a run without a control sends exactly the
+// prompts it always did.
+const renderUserUpdates = (updates: string[] | undefined, fresh = 0, advice = ''): string => {
+  if (!updates || updates.length === 0) {
+    return ''
+  }
+  const firstNew = fresh > 0 ? updates.length - fresh : updates.length
+  const lines = updates.map(
+    (u, i) =>
+      `${i + 1}. ${quoted(u)}${i >= firstNew ? '   [NEW - not yet reflected in the plan]' : ''}`,
+  )
+  const head = `Messages from the user, sent while the agent was working (oldest first; they speak for the user and win over the original request where they conflict):\n${lines.join('\n')}`
+  return advice ? `${head}\n${advice}` : head
+}
+
+const REPLANNER_UPDATES_ADVICE = `Weigh the [NEW] messages against the remaining plan: "revise" the remaining steps so they are honoured (and keep honouring the older ones), "finish" if the user says to stop or the request is already met, "continue" only if the remaining steps already fit them.`
+
+const SYNTHESIZER_UPDATES_ADVICE = `Answer with these in mind: they changed what was asked. Say plainly if one of them could not be honoured in time.`
+
+// The message a model gets in the MIDDLE of a step, after a round of tool calls: what the
+// user just said. Not a stage prompt - the executor appends it as a user turn.
+export const renderUserMessages = (texts: string[]): string =>
+  `NEW MESSAGE FROM THE USER, sent while you were working:\n${texts
+    .map((t) => `- ${quoted(t)}`)
+    .join(
+      '\n',
+    )}\nIt speaks for the user and wins over the request and the plan where they conflict. Take it into account from here on, then carry on with this step - or finish the step now if the message makes the rest of it pointless.`
+
 export const buildExecutorUserPrompt = (
   input: string,
   plan: IPlan,
@@ -300,10 +332,12 @@ export const buildExecutorUserPrompt = (
   trace: IStepResult[],
   history?: IConversationTurn[],
   view?: ITraceView,
+  updates?: string[],
 ): string =>
   [
     history?.length ? `Conversation history:\n${renderHistory(history)}\n` : '',
     `Original user request:\n${input}`,
+    updates?.length ? `\n${renderUserUpdates(updates)}` : '',
     '',
     `Overall plan:\n${renderPlan(plan)}`,
     '',
@@ -346,9 +380,12 @@ export const buildReplannerUserPrompt = (
   trace: IStepResult[],
   nextStep: IPlanStep | null,
   view?: ITraceView,
+  updates?: string[],
+  newUpdates = 0,
 ): string =>
   [
     `Original user request:\n${input}`,
+    updates?.length ? `\n${renderUserUpdates(updates, newUpdates, REPLANNER_UPDATES_ADVICE)}` : '',
     '',
     `Current plan:\n${renderPlan(plan)}`,
     '',
@@ -381,10 +418,12 @@ export const buildSynthesizerUserPrompt = (
   trace: IStepResult[],
   history?: IConversationTurn[],
   view?: ITraceView,
+  updates?: string[],
 ): string =>
   [
     history?.length ? `Conversation history:\n${renderHistory(history)}\n` : '',
     `User request:\n${input}`,
+    updates?.length ? `\n${renderUserUpdates(updates, 0, SYNTHESIZER_UPDATES_ADVICE)}` : '',
     '',
     `Plan that was executed:\n${renderPlan(plan)}`,
     '',

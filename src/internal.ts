@@ -23,6 +23,9 @@ export interface IRunState {
   // Running summary of trace[0, traceSummaryUpTo).
   traceSummary?: string
   traceSummaryUpTo: number
+  // What the user said while the run was going (RunControl.send), oldest first, and whether
+  // the replanner has weighed each. Reconciled ones always precede the unreconciled ones.
+  userUpdates: { text: string; reconciled: boolean }[]
 }
 
 export interface IAgentInternalContext {
@@ -43,4 +46,8 @@ export interface IAgentInternalContext {
   approval?: IApprovalController
   // Per-run state; set by the runner on its per-run copy of the context.
   run?: IRunState
+  // Take what the user said since the last boundary, for delivery INSIDE a step (between
+  // tool-calling rounds): records it, announces it, returns the texts. Set only when the
+  // run has a control.
+  takeRoundUpdates?: () => string[]
 }

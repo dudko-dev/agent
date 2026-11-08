@@ -54,7 +54,14 @@ const streamOnce = async (
   const result = streamText({
     model: ctx.synthesizerModel,
     ...call,
-    prompt: buildSynthesizerUserPrompt(input, plan, trace, history, view),
+    prompt: buildSynthesizerUserPrompt(
+      input,
+      plan,
+      trace,
+      history,
+      view,
+      ctx.run?.userUpdates.map((u) => u.text),
+    ),
     abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
   })
 

@@ -33,6 +33,9 @@ export const decideNextAction = async (
   nextStep: IPlanStep | null,
   ctx: IAgentInternalContext,
   signal?: AbortSignal,
+  // How many of the user's latest messages (ctx.run.userUpdates) the plan has not been
+  // weighed against yet.
+  newUpdates = 0,
 ): Promise<ReplanDecision> =>
   withSpan('agent.replan', { [ATTR.PHASE]: 'replan' }, async (span) => {
     const catalogMode = catalogModeFor(effectiveToolStrategy(ctx))
@@ -57,7 +60,15 @@ export const decideNextAction = async (
           model: ctx.plannerModel,
           schema: DecisionSchema,
           ...call,
-          prompt: buildReplannerUserPrompt(input, plan, trace, nextStep, view),
+          prompt: buildReplannerUserPrompt(
+            input,
+            plan,
+            trace,
+            nextStep,
+            view,
+            ctx.run?.userUpdates.map((u) => u.text),
+            newUpdates,
+          ),
           abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
         })
         const usage: IUsage = normalizeUsage(r.usage)

@@ -485,6 +485,8 @@ export const createSubagentTool = (opts: ISubagentToolOptions): Tool => {
         onParentAbort()
       }
       let timedOut = false
+      let stoppedByUser = false
+      let unregister: (() => void) | undefined
       const timer =
         typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
           ? setTimeout(() => {
@@ -510,6 +512,20 @@ export const createSubagentTool = (opts: ISubagentToolOptions): Tool => {
           task,
           ...(profile ? { profile: profileName } : {}),
         })
+        // Listed in the run's control from here, so the host can stop THIS child on its own.
+        unregister = store?.control?.registerSubagent(
+          {
+            id,
+            name,
+            task,
+            ...(profile ? { profile: profileName } : {}),
+            startedAt: Date.now(),
+          },
+          () => {
+            stoppedByUser = true
+            ac.abort(new DOMException('Aborted', 'AbortError'))
+          },
+        )
         const out =
           isolation === 'worker'
             ? await runInWorker(opts, config, task, ac.signal, onChildEvent)
@@ -519,15 +535,25 @@ export const createSubagentTool = (opts: ISubagentToolOptions): Tool => {
         emit({ type: 'subagent.complete', id, name, text, usage: childUsage })
         return text
       } catch (err) {
-        const message = timedOut
-          ? `subagent "${name}" timed out after ${opts.timeoutMs}ms`
-          : errorMessage(err)
-        emit({ type: 'subagent.error', id, name, error: message })
-        if (timedOut) {
+        // The user's stop wins over a deadline that fired at the same moment.
+        const message = stoppedByUser
+          ? `subagent "${name}" was stopped by the user before it finished - carry on without its result, or take another approach`
+          : timedOut
+            ? `subagent "${name}" timed out after ${opts.timeoutMs}ms`
+            : errorMessage(err)
+        emit({
+          type: 'subagent.error',
+          id,
+          name,
+          error: message,
+          ...(stoppedByUser ? { stopped: true } : {}),
+        })
+        if (stoppedByUser || timedOut) {
           throw new Error(message)
         }
         throw err
       } finally {
+        unregister?.()
         if (timer) {
           clearTimeout(timer)
         }
