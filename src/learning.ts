@@ -308,6 +308,7 @@ export const createLearning = async (
       description:
         'Write down a lesson so you can reuse it later in this session: what you did when you got stuck and what worked. ' +
         'Call it once you have SOLVED a problem that was not obvious - a tool error you worked around, an assumption you had wrong, a procedure you had to look up. ' +
+        'Write it for your future self at the START of the same kind of task: begin with what to do from the very first call so the problem never happens, and mention the approach that failed only as what to avoid. Do not retell what happened. ' +
         'It becomes a skill in the SKILLS list; load_skill reads it back. Never put secrets, keys or personal data in it. ' +
         'Saving the same name again updates your earlier lesson.',
       inputSchema: z.object({
@@ -320,7 +321,7 @@ export const createLearning = async (
         instructions: z
           .string()
           .describe(
-            'The steps that worked, as short markdown. What to do, in order, and what to avoid.',
+            'What to do NEXT TIME, in order, starting from the approach that works (e.g. `Pass format "jpg"`). The approach that failed goes last, as what to avoid. Short markdown, not a story of what happened.',
           ),
         sources: z
           .array(z.string())

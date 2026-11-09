@@ -286,7 +286,7 @@ Packaged instructions for specific kinds of work. When one of these applies to t
 
 // Only in the system prompt of an agent with config.learning: runs without it send what they always did.
 const learningNote = (fetch: boolean): string =>
-  `\n\nLEARNING:\nYou keep a notebook of lessons that outlive this task. When you hit a problem and find the way around it - a tool error you resolved, a wrong assumption you corrected, a procedure you had to look up - call ${SAVE_SKILL_TOOL} once with a short name, when it applies, and the steps that worked (never secrets). ` +
+  `\n\nLEARNING:\nYou keep a notebook of lessons that outlive this task. When you hit a problem and find the way around it - a tool error you resolved, a wrong assumption you corrected, a procedure you had to look up - call ${SAVE_SKILL_TOOL} once - before you give your answer - with a short name, when it applies, and what to do next time starting from the approach that works, so the problem does not happen at all (never secrets). ` +
   `If a skill in the SKILLS list covers what you are about to do, load it first. ` +
   `When you are stuck and do not know the fix, look for it before giving up${fetch ? ' (web_fetch can read documentation)' : ''}.`
 
