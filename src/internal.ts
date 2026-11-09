@@ -20,6 +20,8 @@ export interface IRunState {
   stepActive?: Set<string>
   // Skill names active for the rest of the run, in activation order.
   activeSkills: string[]
+  // Pages web_fetch read in this run (origin + path), kept as provenance for any lesson the run writes.
+  fetched?: string[]
   // Running summary of trace[0, traceSummaryUpTo).
   traceSummary?: string
   traceSummaryUpTo: number
@@ -43,6 +45,8 @@ export interface IAgentInternalContext {
   // The find_tools built-in, when the search strategy is possible.
   findTools?: ToolSet
   skills?: ISkill[]
+  // Set when config.learning is on (the executor is told to write lessons down).
+  learning?: { nudge: boolean }
   approval?: IApprovalController
   // Per-run state; set by the runner on its per-run copy of the context.
   run?: IRunState

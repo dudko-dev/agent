@@ -154,6 +154,11 @@ export const createWebFetchTool = (options: IWebFetchOptions = {}): Tool => {
         const page = html ? htmlToText(raw.text) : { text: raw.text }
         const text = page.text.slice(0, cap)
         emit({ type: 'egress.request', url: shown, allowed: true, status: res.status })
+        // Provenance for any lesson this run writes afterwards: chosen by the harness, not the model.
+        const state = runContext.getStore()?.state
+        if (state) {
+          ;(state.fetched ??= []).push(shown)
+        }
         return {
           url: res.url || url,
           status: res.status,

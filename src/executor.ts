@@ -6,6 +6,7 @@ import { stageCallOptions } from './call-options.ts'
 import type { IAgentInternalContext } from './internal.ts'
 import { hasTokenLimits, limitsStopCondition, resolveLimits } from './limits.ts'
 import { effectiveToolStrategy } from './planner.ts'
+import { WEB_FETCH_TOOL } from './web-fetch.ts'
 import { buildExecutorUserPrompt, composeExecutorSystem, renderUserMessages } from './prompts.ts'
 import { stageEmitsThoughts } from './thinking.ts'
 import { MAX_CARRIED_DISCOVERED_TOOLS } from './tool-search.ts'
@@ -223,6 +224,7 @@ const runOnce = async (
       activeSkills: run?.activeSkills,
       searchMode: Boolean(active),
       toolCount: ctx.toolCatalog.length,
+      ...(ctx.learning?.nudge ? { learning: { fetch: Boolean(ctx.tools[WEB_FETCH_TOOL]) } } : {}),
     }),
   )
   const emitThoughts = stageEmitsThoughts(ctx.config, 'executor')
