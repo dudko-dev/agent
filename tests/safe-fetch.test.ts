@@ -317,6 +317,18 @@ test('safe fetch: the answer DNS gave is the answer that is judged - a bad addre
   await assert.rejects(h('https://nowhere.example/'), code('dns'))
 })
 
+test('safe fetch: a NAME that resolves into a denied range is refused, whatever the name says', async () => {
+  const f = createSafeFetch({
+    deny: ['93.184.216.0/24', '2606:4700::/32'],
+    lookup: async (host) =>
+      host === 'v6.example'
+        ? [{ address: '2606:4700:4700::1111', family: 6 }]
+        : [{ address: '93.184.216.34', family: 4 }],
+  })
+  await assert.rejects(f('https://friendly.example/'), code('denied-address'))
+  await assert.rejects(f('https://v6.example/'), code('denied-address'))
+})
+
 test('safe fetch: connects to the validated address and keeps the name (Host), over a real socket', async () => {
   const srv = await serve((_q, res) => res.end('hello from the server'))
   try {

@@ -29,7 +29,7 @@ export const htmlToText = (html: string): { title?: string; text: string } => {
   const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1]
   const text = html
     .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(script|style|noscript|template|svg|head)\b[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<(script|style|noscript|template|svg|head|title)\b[\s\S]*?<\/\1>/gi, ' ')
     .replace(/<(br|hr)\b[^>]*>|<\/(p|div|li|h[1-6]|tr|section|article|pre|blockquote)>/gi, '\n')
     .replace(/<[^>]+>/g, ' ')
     .replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (m, e: string) => {
