@@ -45,8 +45,10 @@ export interface IAgentInternalContext {
   // The find_tools built-in, when the search strategy is possible.
   findTools?: ToolSet
   skills?: ISkill[]
-  // Set when config.learning is on (the executor is told to write lessons down).
-  learning?: { nudge: boolean }
+  // Set when config.learning is on (the executor is told to write lessons down). `tools` are the
+  // notebook's tool names: callable in every step whatever the strategy narrows to (they are still
+  // wrapped and gated like any other tool).
+  learning?: { nudge: boolean; tools: string[] }
   approval?: IApprovalController
   // Per-run state; set by the runner on its per-run copy of the context.
   run?: IRunState

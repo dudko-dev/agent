@@ -491,3 +491,50 @@ test('learning: a host tool named save_skill replaces the built-in one - the hos
     assert.deepEqual(agent.listLearnedSkills(), [])
   })
 })
+
+// The model is told to write lessons down; whatever narrows its tools must not take that away.
+for (const strategy of ['plan-narrowed', 'search'] as const) {
+  test(`learning: save_skill stays callable under toolSelectionStrategy "${strategy}"`, async () => {
+    const script: Script = (req) => {
+      switch (stageOf(req)) {
+        case 'planner':
+          // The plan names one tool; the lesson tools are not on it.
+          return {
+            text: JSON.stringify({
+              thought: 'Do it.',
+              steps: [
+                {
+                  id: 's1',
+                  description: 'Step s1',
+                  expectedOutcome: 'done',
+                  suggestedTools: ['convert'],
+                  requiresTools: true,
+                },
+              ],
+            }),
+          }
+        case 'executor':
+          return toolResults(req).length === 0
+            ? { toolCalls: [{ name: 'save_skill', args: LESSON }] }
+            : { text: 'ok' }
+        case 'replanner':
+          return { text: JSON.stringify({ mode: 'continue', reason: 'ok' }) }
+        default:
+          return { text: 'Done.' }
+      }
+    }
+    await withLlm(script, async ({ llm, open }) => {
+      const { convert } = quirky()
+      const agent = await open({
+        tools: { convert },
+        learning: true,
+        toolSelectionStrategy: strategy,
+      })
+      await agent.run({ input: 'x' })
+      const offered = toolNames(at(llm, 'executor')[0])
+      assert.ok(offered.includes('save_skill'), `offered: ${offered.join(', ')}`)
+      assert.ok(offered.includes('forget_skill'), `offered: ${offered.join(', ')}`)
+      assert.equal(agent.listLearnedSkills().length, 1, 'and it works')
+    })
+  })
+}

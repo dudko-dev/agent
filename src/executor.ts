@@ -127,7 +127,7 @@ export const buildExecutorTools = (
   if (strategy === 'search') {
     const tools: ToolSet = { ...ctx.tools, ...builtins, ...(ctx.findTools ?? {}) }
     const active = new Set<string>([...Object.keys(builtins), ...Object.keys(ctx.findTools ?? {})])
-    for (const name of step.suggestedTools ?? []) {
+    for (const name of [...(step.suggestedTools ?? []), ...(ctx.learning?.tools ?? [])]) {
       if (ctx.tools[name]) {
         active.add(name)
       }
@@ -139,7 +139,17 @@ export const buildExecutorTools = (
     }
     return { tools, active }
   }
-  const base = buildActiveToolSet(ctx, step)
+  const narrowed = buildActiveToolSet(ctx, step)
+  // The notebook's tools are not the plan's to hand out: a narrowed step still gets them.
+  const base: ToolSet =
+    strategy === 'plan-narrowed' && ctx.learning?.tools.length
+      ? {
+          ...narrowed,
+          ...Object.fromEntries(
+            ctx.learning.tools.filter((n) => ctx.tools[n]).map((n) => [n, ctx.tools[n]]),
+          ),
+        }
+      : narrowed
   const tools: ToolSet = Object.keys(builtins).length ? { ...base, ...builtins } : base
   // Defence-in-depth: explicitly tell the SDK which tools are callable in
   // this step. Only worth it in narrowed mode; in 'all' mode it's just a

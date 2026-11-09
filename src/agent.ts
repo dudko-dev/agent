@@ -379,6 +379,7 @@ export const createAgent = async (
       ? {
           learning: {
             nudge: typeof config.learning === 'object' ? config.learning.nudge !== false : true,
+            tools: Object.keys(learning.tools),
           },
         }
       : {}),
