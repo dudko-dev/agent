@@ -2,7 +2,7 @@ import { stepCountIs, streamText, type ModelMessage, type StopCondition, type To
 import { resolvePromptCaching, withRollingBreakpoint } from './caching.ts'
 import { resolveCompaction } from './compaction.ts'
 import { createToolResultClearer } from './context-editing.ts'
-import { stageCallOptions } from './call-options.ts'
+import { outputCapNotice, stageCallOptions } from './call-options.ts'
 import type { IAgentInternalContext } from './internal.ts'
 import { hasTokenLimits, limitsStopCondition, resolveLimits } from './limits.ts'
 import { effectiveToolStrategy } from './planner.ts'
@@ -382,7 +382,15 @@ const runOnce = async (
     }
   }
 
-  const [text, usage] = await Promise.all([result.text, result.usage])
+  const [text, usage, finishReason] = await Promise.all([
+    result.text,
+    result.usage,
+    result.finishReason,
+  ])
+  const cut = outputCapNotice(ctx.config, 'executor', finishReason)
+  if (cut) {
+    ctx.emit({ type: 'log', level: 'warn', message: cut })
+  }
   const { summary: cleaned, blocked } = splitBlockerSentinel(text.trim())
   const summary =
     cleaned.length > 0

@@ -132,10 +132,10 @@ test('stageCallOptions merges thinking + caching and applies the per-call cap', 
   })
   assert.equal(typeof call.instructions, 'object')
 
-  // Defaults: no thinking, no cap, caching on.
+  // Defaults: no thinking, the window-derived cap (8000 at the default 128k window), caching on.
   const plain = stageCallOptions(config(), 'executor', 'EXEC')
   assert.equal(plain.reasoning, undefined)
-  assert.equal(plain.maxOutputTokens, undefined)
+  assert.equal(plain.maxOutputTokens, 8000)
   assert.deepEqual(plain.providerOptions, { openai: { promptCacheKey: 'app:executor' } })
 
   const uncached = stageCallOptions(config({ promptCaching: false }), 'synthesizer', 'S')

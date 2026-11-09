@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict'
 import test, { beforeEach } from 'node:test'
-import { loadConfig, parseThinking, parseToolRules, skillsDirFromEnv } from '../src/cli/config.ts'
+import {
+  loadConfig,
+  parsePerCallTokens,
+  parseThinking,
+  parseToolRules,
+  skillsDirFromEnv,
+} from '../src/cli/config.ts'
 import { DirSkillStore, decideToolPermission, type IEgressPolicy } from '../src/index.ts'
 
 const CONFIG_KEYS = [
@@ -38,6 +44,7 @@ const CONFIG_KEYS = [
   'AGENT_MAX_TOOL_CALLS',
   'AGENT_TOOL_APPROVAL',
   'AGENT_TOOL_RULES',
+  'AGENT_PER_CALL_TOKENS',
   'AGENT_SKILLS_DIR',
   'AGENT_CONTEXT_WINDOW_TOKENS',
   'AGENT_COMPACTION',
@@ -461,4 +468,35 @@ test('AGENT_COMPACTION_THRESHOLD: nonsense is an error, not a silent default', (
     process.env.AGENT_COMPACTION_THRESHOLD = bad
     assert.throws(() => loadConfig(), /AGENT_COMPACTION_THRESHOLD must be a percent/, bad)
   }
+})
+
+test('AGENT_PER_CALL_TOKENS: per-stage output caps, 0 meaning "no cap", validated eagerly', () => {
+  assert.equal(parsePerCallTokens(undefined), undefined)
+  assert.equal(parsePerCallTokens('  '), undefined)
+  assert.equal(parsePerCallTokens('{}'), undefined)
+  assert.deepEqual(parsePerCallTokens('{"executor":16000,"synthesizer":0,"compaction":512}'), {
+    executor: 16000,
+    synthesizer: 0,
+    compaction: 512,
+  })
+  for (const bad of [
+    'nope',
+    '[]',
+    'null',
+    '{"sythesizer":100}',
+    '{"executor":"16000"}',
+    '{"executor":-1}',
+    '{"executor":1.5}',
+  ]) {
+    assert.throws(() => parsePerCallTokens(bad), /AGENT_PER_CALL_TOKENS/, bad)
+  }
+
+  setMinimalOpenAi()
+  process.env.AGENT_PER_CALL_TOKENS = '{"planner":3000}'
+  process.env.AGENT_MAX_OUTPUT_TOKENS = '200'
+  assert.deepEqual(loadConfig().limits, { maxOutputTokens: 200, perCall: { planner: 3000 } })
+  delete process.env.AGENT_MAX_OUTPUT_TOKENS
+  assert.deepEqual(loadConfig().limits, { perCall: { planner: 3000 } })
+  process.env.AGENT_PER_CALL_TOKENS = '{"plannr":1}'
+  assert.throws(() => loadConfig(), /unknown stage "plannr"/)
 })

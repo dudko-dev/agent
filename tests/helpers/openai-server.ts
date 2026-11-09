@@ -18,6 +18,9 @@ export interface IChatRequest {
   messages: { role: string; content: unknown; tool_call_id?: string }[]
   tools?: { function?: { name?: string } }[]
   response_format?: { type?: string; json_schema?: { name?: string; schema?: unknown } }
+  /** The per-call output cap the agent sent (the chat-completions name for maxOutputTokens). */
+  max_tokens?: number
+  max_completion_tokens?: number
 }
 
 /** What the scripted model should answer with. */
@@ -28,6 +31,8 @@ export interface IScriptedReply {
   toolCalls?: { name: string; args: unknown }[]
   /** Streamed first as `reasoning_content` deltas (the model's thoughts). */
   reasoning?: string
+  /** Finish the answer as a model cut off by its output cap does (`finish_reason: 'length'`). */
+  cutOff?: boolean
   /** Hold the answer this long (a slow model, to act mid-run). */
   delayMs?: number
   /** Usage to report instead of the default 10 in / 5 out. */
@@ -136,7 +141,12 @@ const streamBody = (reply: IScriptedReply): string => {
         }),
       )
     }
-    parts.push(sse({ ...CHUNK_HEAD, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }))
+    parts.push(
+      sse({
+        ...CHUNK_HEAD,
+        choices: [{ index: 0, delta: {}, finish_reason: reply.cutOff ? 'length' : 'stop' }],
+      }),
+    )
   }
 
   parts.push(sse({ ...CHUNK_HEAD, choices: [], usage: usageOf(reply) }))
@@ -164,7 +174,7 @@ const jsonBody = (reply: IScriptedReply): string =>
               })),
             }
           : { role: 'assistant', content: reply.text ?? '' },
-        finish_reason: reply.toolCalls?.length ? 'tool_calls' : 'stop',
+        finish_reason: reply.toolCalls?.length ? 'tool_calls' : reply.cutOff ? 'length' : 'stop',
       },
     ],
     usage: usageOf(reply),

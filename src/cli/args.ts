@@ -41,6 +41,8 @@ Optional env vars (see env.example for the full list):
   AGENT_MAX_REASONING_TOKENS
   AGENT_MAX_TOTAL_TOKENS
   AGENT_MAX_TOOL_CALLS        cap on tool calls per run
+  AGENT_PER_CALL_TOKENS       JSON: per-stage output cap per LLM call, e.g. {"executor":16000,"synthesizer":0}
+                              (default: a share of the context window; 0 = no cap)
   AGENT_TOOL_APPROVAL         autopilot | ask-writes | ask-all | read-only
   AGENT_TOOL_RULES            JSON: { "<tool or glob*>": "allow" | "ask" | "deny" } - beats the mode
   AGENT_SKILLS_DIR            folder of <skill>/SKILL.md skills
