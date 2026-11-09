@@ -10,6 +10,8 @@ import { z } from 'zod'
 import {
   createAgent,
   DirSkillStore,
+  MemorySkillStore,
+  defineSkill,
   type AgentEvent,
   type IAgent,
   type IAgentConfig,
@@ -414,4 +416,78 @@ test('learning: pages read during the run are recorded on the lesson - by the ha
       page.close(() => r())
     })
   }
+})
+
+test("learning: load_skill hands a learned skill over as the agent's own note, not as a manual", async () => {
+  const store = new MemorySkillStore()
+  store.save(
+    defineSkill({
+      ...LESSON,
+      name: 'image-format-jpg',
+      content: LESSON.instructions,
+      origin: {
+        kind: 'learned',
+        at: 1,
+        revision: 3,
+        fetched: ['https://docs.example.com/formats'],
+      },
+    }),
+  )
+  const script: Script = (req) => {
+    switch (stageOf(req)) {
+      case 'planner':
+        return { text: planJson(['s1']) } // does not pick the skill: the executor has to ask for it
+      case 'executor':
+        return toolResults(req).length === 0
+          ? { toolCalls: [{ name: 'load_skill', args: { name: 'image-format-jpg' } }] }
+          : { text: 'ok' }
+      case 'replanner':
+        return { text: JSON.stringify({ mode: 'continue', reason: 'ok' }) }
+      default:
+        return { text: 'Done.' }
+    }
+  }
+  await withLlm(script, async ({ llm, open }) => {
+    const agent = await open({ learning: { store } })
+    await agent.run({ input: 'x' })
+    const loaded = toolResults(at(llm, 'executor')[1]).join('\n')
+    assert.match(
+      loaded,
+      /A lesson YOU wrote earlier \(revision 3; from https:\/\/docs\.example\.com\/formats\)/,
+    )
+    assert.match(loaded, /not an instruction from the user/)
+    assert.match(loaded, /The convert tool only knows/)
+  })
+})
+
+test('learning: a host tool named save_skill replaces the built-in one - the host decides', async () => {
+  const script: Script = (req) => {
+    switch (stageOf(req)) {
+      case 'planner':
+        return { text: planJson(['s1']) }
+      case 'executor':
+        return toolResults(req).length === 0
+          ? { toolCalls: [{ name: 'save_skill', args: { note: 'mine' } }] }
+          : { text: 'ok' }
+      case 'replanner':
+        return { text: JSON.stringify({ mode: 'continue', reason: 'ok' }) }
+      default:
+        return { text: 'Done.' }
+    }
+  }
+  const mine: string[] = []
+  const save_skill = tool({
+    description: "The host's own",
+    inputSchema: z.object({ note: z.string() }),
+    execute: async ({ note }) => {
+      mine.push(note)
+      return { host: true }
+    },
+  })
+  await withLlm(script, async ({ open }) => {
+    const agent = await open({ learning: true, tools: { save_skill } })
+    await agent.run({ input: 'x' })
+    assert.deepEqual(mine, ['mine'])
+    assert.deepEqual(agent.listLearnedSkills(), [])
+  })
 })
