@@ -21,6 +21,11 @@
     as skills, `origin.kind: 'learned'`; Memory/Dir stores; secret scan, caps, operator skills
     never overwritten). Knowledge only, never policy: a lesson is loaded under `learnedPreamble`.
     Every guard has a test in `tests/learning*.test.ts` and a mutation check.
+  - `call-options.ts` also owns the per-call output caps (`stageOutputCap`): `limits.perCall` wins (0 = no
+    cap), otherwise a share of the context window between a floor and a ceiling (`OUTPUT_CAP_SHARES`), and
+    none for a stage that thinks (reasoning counts against the cap on OpenAI / Gemini). A call the cap cut
+    off is reported (`outputCapNotice`, `withCapHint`). Never add a fixed default number: it is wrong at one
+    end of the range of windows.
   - `compaction.ts` also owns the estimate (`estimateTokens`: script-aware, errs high) and the fixed-prompt
     overhead (`promptOverheadTokens`): compaction is judged on prompt + history + trace together against
     `thresholdRatio` (0.85) of the window, never on one part alone. The estimate is calibrated high on Claude's tokenizer (1.1-1.4x real, never below): keep it that way. `agent.usage` is counted from the
