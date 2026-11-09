@@ -519,10 +519,131 @@ test('safe fetch: a server that never answers is cut off at the timeout; the cal
   }
 })
 
+test('safe fetch: the timeout also covers the BODY - a server that drips and stalls cannot hold the reader', async () => {
+  const srv = await serve((_q, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.write('the first bytes arrive, then silence')
+    // never ends
+  })
+  try {
+    const f = createSafeFetch(local(srv.port, { timeoutMs: 300 }))
+    const res = await f(`http://app.test:${srv.port}/`)
+    assert.equal(res.status, 200, 'the headers came in time')
+    const t0 = Date.now()
+    await assert.rejects(res.text())
+    assert.ok(Date.now() - t0 < 3000, 'and the stalled body was cut off')
+  } finally {
+    await srv.close()
+  }
+})
+
 test('safe fetch: input that is not a plain http(s) URL is refused before anything happens', async () => {
   const f = createSafeFetch({ allowPrivateNetwork: true, protocols: ['http'], ports: [1] })
   await assert.rejects(f('not a url'), code('bad-url'))
   await assert.rejects(f('http://example.com:1@evil.example/'), code('credentials-in-url'))
   await assert.rejects(f('javascript:alert(1)'), code('bad-protocol'))
   await assert.rejects(f('data:text/plain,hi'), code('bad-protocol'))
+})
+
+// ── TLS, for real ────────────────────────────────────────────────────────────
+// A server with a certificate for "secure.test", signed by a CA the test trusts via `ca`:
+// proves the HTTPS path - SNI, verification, the pinned address - and the https→http rule.
+
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import https from 'node:https'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+
+const makeCert = (): { cert: string; key: string } => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'egress-tls-'))
+  try {
+    execFileSync(
+      'openssl',
+      [
+        'req',
+        '-x509',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-days',
+        '1',
+        '-keyout',
+        path.join(dir, 'key.pem'),
+        '-out',
+        path.join(dir, 'cert.pem'),
+        '-subj',
+        '/CN=secure.test',
+        '-addext',
+        'subjectAltName=DNS:secure.test',
+      ],
+      { stdio: 'ignore' },
+    )
+    return {
+      cert: readFileSync(path.join(dir, 'cert.pem'), 'utf8'),
+      key: readFileSync(path.join(dir, 'key.pem'), 'utf8'),
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+test('safe fetch over TLS: verified against the CA, SNI is the name, redirect to http is refused', async () => {
+  const { cert, key } = makeCert()
+  const seen: { sni?: string; host?: string }[] = []
+  const plain = await serve((_q, res) => res.end('plain http'))
+  const server = https.createServer(
+    {
+      cert,
+      key,
+      SNICallback: (name, cb) => {
+        seen.push({ sni: name })
+        cb(null, undefined)
+      },
+    },
+    (req, res) => {
+      seen.push({ host: req.headers.host })
+      if (req.url === '/downgrade') {
+        return void res.writeHead(302, { location: `http://app.test:${plain.port}/` }).end()
+      }
+      res.end('secure hello')
+    },
+  )
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+  const port = (server.address() as AddressInfo).port
+  try {
+    const policy: IEgressPolicy = {
+      allowPrivateNetwork: true,
+      protocols: ['https', 'http'],
+      ports: [port, plain.port],
+      lookup: async () => [{ address: '127.0.0.1', family: 4 }],
+    }
+    const trusted = createSafeFetch({ ...policy, ca: cert })
+    const res = await trusted(`https://secure.test:${port}/`)
+    assert.equal(await res.text(), 'secure hello')
+    assert.ok(
+      seen.some((s) => s.sni === 'secure.test'),
+      'SNI carries the NAME, not the pinned IP',
+    )
+    assert.ok(seen.some((s) => s.host === `secure.test:${port}`))
+
+    // Without the CA the certificate is not trusted: verification is never switched off.
+    const untrusted = createSafeFetch(policy)
+    await assert.rejects(untrusted(`https://secure.test:${port}/`), (err: unknown) =>
+      /self.signed|unable to verify|certificate/i.test(
+        String((err as Error).message) + String((err as { code?: string }).code),
+      ),
+    )
+
+    // A secure page may not bounce the agent to plain http - even though http is allowed.
+    plain.hits.length = 0
+    await assert.rejects(trusted(`https://secure.test:${port}/downgrade`), code('bad-protocol'))
+    assert.equal(plain.hits.length, 0, 'the plain http server was never contacted')
+  } finally {
+    await new Promise<void>((r) => {
+      server.closeAllConnections()
+      server.close(() => r())
+    })
+    await plain.close()
+  }
 })

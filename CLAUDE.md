@@ -17,6 +17,10 @@
     `context-editing.ts` (stale tool results → stubs inside a step's loop),
     `subagent.ts` + `subagent-worker.ts` (worker entry, built to
     `dist/subagent-worker.js`).
+  - `safe-fetch.ts` (`createSafeFetch`: own DNS lookup inside the connect, private / metadata
+    ranges refused, allow/deny, redirects re-judged, size/time bounded) + `web-fetch.ts` (the
+    `web_fetch` tool that `config.egress` switches on). Security boundary: every change needs a
+    test in `tests/safe-fetch.test.ts` and a mutation check.
   - `control.ts` (`createRunControl`: send a message into a running loop, stop one
     subagent). The runner drains it at round / step / final boundaries; messages are
     recorded in `IRunState.userUpdates` and in run snapshots.

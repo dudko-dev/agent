@@ -86,6 +86,9 @@ export interface IEgressPolicy {
   maxResponseBytes?: number
   // Whole request, headers and body. Default 15_000.
   timeoutMs?: number
+  // Extra CA certificates to trust (PEM), for a server behind an internal CA. Certificate
+  // verification is never switched off.
+  ca?: string | string[]
   // Resolver; default the system's (dns.lookup, all addresses). The seam for tests and for a
   // resolver of your own (DoH, split-horizon).
   lookup?: (hostname: string) => Promise<IResolvedAddress[]>
@@ -101,6 +104,7 @@ export interface IResolvedEgressPolicy {
   maxRedirects: number
   maxResponseBytes: number
   timeoutMs: number
+  ca?: string | string[]
   lookup: (hostname: string) => Promise<IResolvedAddress[]>
 }
 
@@ -130,6 +134,7 @@ export const resolveEgressPolicy = (policy: IEgressPolicy = {}): IResolvedEgress
     maxRedirects: Math.max(0, policy.maxRedirects ?? 3),
     maxResponseBytes: Math.max(1, policy.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES),
     timeoutMs: Math.max(1, policy.timeoutMs ?? 15_000),
+    ...(policy.ca ? { ca: policy.ca } : {}),
     lookup: policy.lookup ?? systemLookup,
   }
 }
@@ -553,6 +558,7 @@ const sendOnce = (
         agent: false,
         lookup: guardedLookup(policy) as never,
         ...(secure && !isIP(hostname) ? { servername: hostname } : {}),
+        ...(secure && policy.ca ? { ca: policy.ca } : {}),
         signal,
       },
       resolve,
