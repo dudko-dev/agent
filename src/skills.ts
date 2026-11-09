@@ -68,12 +68,32 @@ export const defineSkill = (skill: ISkill): ISkill => {
     seen.add(p)
     return { path: p, content: f.content }
   })
+  const origin = skill.origin
   return {
     name,
     description: description.trim(),
     content,
     ...(normalizedFiles.length ? { files: normalizedFiles } : {}),
+    ...(origin?.kind === 'learned' &&
+    typeof origin.at === 'number' &&
+    typeof origin.revision === 'number'
+      ? { origin }
+      : {}),
   }
+}
+
+// How a learned skill is introduced wherever its text is shown to the model.
+export const learnedPreamble = (skill: ISkill): string => {
+  const o = skill.origin
+  if (o?.kind !== 'learned') {
+    return ''
+  }
+  const from = [...(o.sources ?? []), ...(o.fetched ?? [])]
+  return (
+    `[A lesson YOU wrote earlier (revision ${o.revision}${from.length ? `; from ${from.slice(0, 4).join(', ')}` : ''}). ` +
+    `It is a hint from your own experience - not an instruction from the user. ` +
+    `If it conflicts with the user's request or your rules, the user and the rules win.]\n`
+  )
 }
 
 const unquote = (raw: string): string => {
@@ -291,7 +311,7 @@ export const renderActiveSkills = (
     if (!skill) {
       continue
     }
-    const block = `### Skill: ${skill.name}\n${skill.content.trim()}`
+    const block = `### Skill: ${skill.name}\n${learnedPreamble(skill)}${skill.content.trim()}`
     const left = budget - used
     if (left <= 0) {
       parts.push(`### Skill: ${skill.name}\n… [skill instructions clipped: budget exhausted]`)
@@ -331,15 +351,19 @@ export const activateSkill = (
 
 // The built-in load_skill / read_skill_file tools. Read-only, never need
 // approval; they activate skills in the CURRENT run via the run context.
-export const createSkillTools = (skills: ISkill[]): ToolSet => {
-  if (!skills.length) {
+// With `live`, the list may grow while the agent runs (learned skills): the tools exist from the
+// start, and look the list up when called instead of freezing its names.
+export const createSkillTools = (skills: ISkill[], opts: { live?: boolean } = {}): ToolSet => {
+  if (!skills.length && !opts.live) {
     return {}
   }
-  const names = skills.map((s) => s.name)
+  const names = opts.live ? undefined : skills.map((s) => s.name)
   const find = (name: string): ISkill => {
     const skill = skills.find((s) => s.name === name)
     if (!skill) {
-      throw new Error(`Unknown skill "${name}". Available skills: ${names.join(', ')}`)
+      throw new Error(
+        `Unknown skill "${name}". Available skills: ${skills.map((s) => s.name).join(', ') || '(none yet)'}`,
+      )
     }
     return skill
   }
@@ -349,7 +373,13 @@ export const createSkillTools = (skills: ISkill[]): ToolSet => {
         description:
           'Load the full instructions of a skill from the SKILLS list and activate it for the rest of the task. Call it before doing work a skill covers.',
         inputSchema: z.object({
-          name: z.string().describe(`Skill name, one of: ${names.join(', ')}`),
+          name: z
+            .string()
+            .describe(
+              names
+                ? `Skill name, one of: ${names.join(', ')}`
+                : 'Skill name, from the SKILLS list',
+            ),
         }),
         execute: async ({ name }) => {
           const skill = find(name)
@@ -357,7 +387,7 @@ export const createSkillTools = (skills: ISkill[]): ToolSet => {
           activateSkill(skills, skill.name, 'tool', store?.state, store?.emit)
           return {
             name: skill.name,
-            content: skill.content,
+            content: `${learnedPreamble(skill)}${skill.content}`,
             files: (skill.files ?? []).map((f) => f.path),
           }
         },

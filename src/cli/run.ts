@@ -219,6 +219,16 @@ export const runRepl = async (): Promise<void> => {
             : `  << subagent ${event.name} failed: ${event.error}`,
         )
         break
+      case 'skill.learned':
+        endLine()
+        console.log(
+          `[learned] ${event.update ? 'updated' : 'new'} skill "${event.name}": ${truncate(event.description, 160)}${event.sources.length ? ` (from ${event.sources.slice(0, 3).join(', ')})` : ''}`,
+        )
+        break
+      case 'skill.forgotten':
+        endLine()
+        console.log(`[learned] forgot "${event.name}"`)
+        break
       case 'message.queued':
         endLine()
         console.log(
@@ -544,6 +554,31 @@ export const runRepl = async (): Promise<void> => {
             lastAskMode = mode as ToolApprovalMode
           }
           console.log(`[approval] mode=${mode}`)
+        }
+        continue
+      }
+      if (prompt === '/skills') {
+        const all = agent.listSkills()
+        if (all.length === 0) {
+          console.log('[skills] (none)')
+        }
+        for (const s of all) {
+          console.log(
+            `  - ${s.name}${s.learned ? ' (learned)' : ''}: ${truncate(s.description, 160)}`,
+          )
+        }
+        continue
+      }
+      if (prompt === '/forget' || prompt.startsWith('/forget ')) {
+        const name = prompt.slice('/forget'.length).trim()
+        if (!name) {
+          console.log(
+            '[forget] usage: /forget <name>  (see /skills; only skills the agent learned)',
+          )
+        } else if (await agent.forgetSkill(name)) {
+          console.log(`[forget] ${name} forgotten`)
+        } else {
+          console.log(`[forget] no learned skill named "${name}"`)
         }
         continue
       }

@@ -3,6 +3,7 @@ import type {
   IAgentStageOverride,
   ICompactionConfig,
   IEgressPolicy,
+  ILearningConfig,
   IMcpServerConfig,
   ITokenLimits,
   IToolApprovalConfig,
@@ -13,6 +14,7 @@ import type {
   ToolApprovalMode,
   ToolPermission,
 } from '../index.ts'
+import { DirSkillStore } from '../learning.ts'
 
 const PROVIDERS: readonly ProviderType[] = [
   'openai',
@@ -95,6 +97,7 @@ export const loadConfig = (): IAgentConfig => {
     toolApproval: parseApproval(process.env.AGENT_TOOL_APPROVAL, process.env.AGENT_TOOL_RULES),
     compaction: parseCompaction(),
     egress: parseEgress(),
+    learning: parseLearning(),
     llmTimeoutMs: parseOptionalInt(process.env.AGENT_LLM_TIMEOUT_MS),
     llmMaxRetries: parseOptionalInt(process.env.AGENT_LLM_MAX_RETRIES),
     toolSelectionStrategy: parseToolStrategy(process.env.AGENT_TOOL_SELECTION_STRATEGY),
@@ -244,6 +247,29 @@ export const parseEgress = (env: NodeJS.ProcessEnv = process.env): IEgressPolicy
     ...(protocols ? { protocols: protocols as ('https' | 'http')[] } : {}),
     ...(priv && ['on', 'true', '1', 'yes'].includes(priv) ? { allowPrivateNetwork: true } : {}),
   }
+}
+
+// AGENT_LEARNING=on lets the agent write down what it learned (lessons become skills for the rest
+// of the session - the REPL process). AGENT_LEARNING_DIR=<dir> keeps them as <dir>/<name>/SKILL.md
+// across sessions. A dir without the switch is an error, not a silent no-op.
+export const parseLearning = (
+  env: NodeJS.ProcessEnv = process.env,
+): ILearningConfig | undefined => {
+  const raw = env.AGENT_LEARNING?.trim().toLowerCase()
+  const on = raw !== undefined && ['on', 'true', '1', 'yes'].includes(raw)
+  if (raw && !on && !['off', 'false', '0', 'no'].includes(raw)) {
+    throw new Error(`AGENT_LEARNING must be on | off, got: ${env.AGENT_LEARNING}`)
+  }
+  const dir = env.AGENT_LEARNING_DIR?.trim()
+  if (!on) {
+    if (dir) {
+      throw new Error(
+        'AGENT_LEARNING_DIR set but AGENT_LEARNING is off - set AGENT_LEARNING=on to use it',
+      )
+    }
+    return undefined
+  }
+  return dir ? { store: new DirSkillStore(dir) } : {}
 }
 
 // AGENT_COMPACTION=off disables automatic compaction (the /compact command

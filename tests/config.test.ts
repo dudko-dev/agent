@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { beforeEach } from 'node:test'
 import { loadConfig, parseThinking, parseToolRules, skillsDirFromEnv } from '../src/cli/config.ts'
-import { decideToolPermission, type IEgressPolicy } from '../src/index.ts'
+import { DirSkillStore, decideToolPermission, type IEgressPolicy } from '../src/index.ts'
 
 const CONFIG_KEYS = [
   'AGENT_PROVIDER_TYPE',
@@ -46,6 +46,8 @@ const CONFIG_KEYS = [
   'AGENT_EGRESS_DENY',
   'AGENT_EGRESS_PROTOCOLS',
   'AGENT_EGRESS_ALLOW_PRIVATE',
+  'AGENT_LEARNING',
+  'AGENT_LEARNING_DIR',
 ] as const
 
 beforeEach(() => {
@@ -409,4 +411,33 @@ test('AGENT_EGRESS: a setting without the switch, or a typo, is an error - never
   delete process.env.AGENT_EGRESS_PROTOCOLS
   process.env.AGENT_EGRESS_ALLOW_PRIVATE = 'sure'
   assert.throws(() => loadConfig(), /AGENT_EGRESS_ALLOW_PRIVATE must be on \| off/)
+})
+
+// ── AGENT_LEARNING: lessons the agent writes down ─────────────────────────────
+
+test('AGENT_LEARNING: off by default - the agent writes nothing down', () => {
+  setMinimalOpenAi()
+  assert.equal(loadConfig().learning, undefined)
+  process.env.AGENT_LEARNING = 'off'
+  assert.equal(loadConfig().learning, undefined)
+})
+
+test('AGENT_LEARNING: on keeps lessons for the session; a folder keeps them across sessions', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_LEARNING = 'on'
+  assert.deepEqual(loadConfig().learning, {})
+  process.env.AGENT_LEARNING_DIR = ' ./notebook '
+  const cfg = loadConfig().learning as { store?: unknown }
+  assert.ok(cfg.store instanceof DirSkillStore, 'the folder becomes the store, trimmed')
+})
+
+test('AGENT_LEARNING: a folder without the switch, or a typo, is an error - never a silent no-op', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_LEARNING_DIR = './notebook'
+  assert.throws(() => loadConfig(), /AGENT_LEARNING_DIR set but AGENT_LEARNING is off/)
+  process.env.AGENT_LEARNING = 'off'
+  assert.throws(() => loadConfig(), /AGENT_LEARNING_DIR set but AGENT_LEARNING is off/)
+  delete process.env.AGENT_LEARNING_DIR
+  process.env.AGENT_LEARNING = 'sometimes'
+  assert.throws(() => loadConfig(), /AGENT_LEARNING must be on \| off/)
 })

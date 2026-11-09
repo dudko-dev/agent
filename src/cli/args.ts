@@ -44,6 +44,8 @@ Optional env vars (see env.example for the full list):
   AGENT_TOOL_APPROVAL         autopilot | ask-writes | ask-all | read-only
   AGENT_TOOL_RULES            JSON: { "<tool or glob*>": "allow" | "ask" | "deny" } - beats the mode
   AGENT_SKILLS_DIR            folder of <skill>/SKILL.md skills
+  AGENT_LEARNING              on lets the agent write down lessons as skills (for this session)
+  AGENT_LEARNING_DIR          keep them as <dir>/<name>/SKILL.md across sessions (needs AGENT_LEARNING=on)
   AGENT_EGRESS                on lets the model read the web (web_fetch); off (default) = no outbound requests
   AGENT_EGRESS_ALLOW / _DENY  comma lists: host, *.host, IP or CIDR (deny wins; allow limits to these)
   AGENT_EGRESS_PROTOCOLS      https (default) | http | https,http
@@ -54,6 +56,7 @@ Optional env vars (see env.example for the full list):
 Commands inside the REPL:
   /status, /tools, /history, /reset, /reconnect, /exit
   /compact                    summarise the conversation history now
+  /skills, /forget <name>     list skills (the agent's own marked) / delete one the agent learned
   /agents, /stop [n]          while a run goes: list running subagents / stop one (the run goes on);
                               any other text you type then is said to the running agent
   /autopilot                  toggle autopilot (no tool approval prompts)

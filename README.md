@@ -302,7 +302,7 @@ import { createAgent, loadSkillsFromDir, parseSkillMarkdown, defineSkill } from 
 
 const skills = await loadSkillsFromDir('./skills') // every ./skills/<skill>/SKILL.md
 const agent = await createAgent({ ...config, skills })
-agent.listSkills() // [{ name, description }]
+agent.listSkills() // [{ name, description }] (+ learned: true on the agent's own, see Learning)
 ```
 
 Progressive disclosure keeps them cheap:
@@ -522,6 +522,33 @@ Approval: an open-internet `web_fetch` is a way to leak data through the URL, so
 
 What it is not: a sandbox for what a fetched *page says* — that stays data the model reads, which is why the result is flagged untrusted. And it does not govern the provider's own calls, or the MCP servers and tools you configure — those are your configuration, not the model's. A subagent has its own `egress` (none unless you set it). The browser sibling cannot pin DNS; see `@dudko.dev/agent-web`.
 
+## Learning: lessons that outlive the task
+
+Switch on `learning` and the agent keeps a notebook. When it hits a problem and finds the way around it — a tool error it resolved, a wrong assumption it corrected, a procedure it had to look up — it writes the lesson down with `save_skill`, and the lesson **is a [skill](#skills)**: it shows up in the planner's `SKILLS:` index right away (even for the next step of the same run) and loads with `load_skill` like any other. Nothing new to learn on the reading side.
+
+```ts
+import { createAgent, DirSkillStore } from '@dudko.dev/agent'
+
+const agent = await createAgent({ ...config, learning: true }) // this session (the process)
+// ...or keep them as <dir>/<name>/SKILL.md, readable, editable and committable like your own:
+const agent = await createAgent({ ...config, learning: { store: new DirSkillStore('./learned-skills') } })
+
+agent.listSkills()        // [{ name, description, learned }]
+agent.listLearnedSkills() // the agent's own, with origin: when, which run, revision, where it read
+await agent.forgetSkill('image-format-jpg') // one went stale
+```
+
+It is a *knowledge* feature and nothing else:
+
+- **Knowledge, never policy.** A lesson is loaded under a header saying it is the agent's own hint, not an instruction from the user; the user's request and your rules win a conflict. It cannot grant a permission, switch a tool on or loosen `egress`.
+- **A normal gated tool.** `save_skill` / `forget_skill` go through [tool approval](#tool-approval-and-autopilot) like any write — `ask-writes` asks a human first, `read-only` refuses, a `toolRules` entry can deny them.
+- **No secrets.** Names, descriptions, instructions and sources are scanned for API keys, tokens, private keys and the like; a hit is refused to the model (and never stored). Sources keep origin and path only.
+- **Yours stay yours.** A skill you configured is never overwritten or deleted by the agent; on a name clash yours wins. Caps: `maxSkills` (50), `maxSkillChars` (6000), a one-line description.
+- **Provenance.** Each lesson records when it was written, by which run, its revision and — recorded by the harness, not by the model — the pages `web_fetch` read in that run.
+- **Quiet by default for the rest.** Without `learning` there are no extra tools and not a word more in the prompts. `learning: { nudge: false }` keeps the tools but drops the guidance that tells the executor to write lessons down (and to look for a fix before giving up — with `egress` on, `web_fetch` can read the docs).
+
+Every save emits `skill.learned` (`name`, `description`, `update`, `chars`, `sources`), every forget `skill.forgotten`. CLI: `AGENT_LEARNING=on`, `AGENT_LEARNING_DIR=<dir>`; in the REPL `/skills` lists skills (the agent's own marked) and `/forget <name>` deletes one.
+
 ## Autonomy
 
 The stage prompts are written for an agent that acts on its own:
@@ -605,7 +632,9 @@ Notes:
 interface IAgent {
   run(options: IAgentRunOptions): Promise<IAgentRunResult>
   listTools(): { name: string; description: string; server?: string; readOnly?: boolean }[]
-  listSkills(): { name: string; description: string }[]
+  listSkills(): { name: string; description: string; learned?: true }[]
+  listLearnedSkills(): ISkill[] // the agent's own lessons, with origin (see Learning)
+  forgetSkill(name: string): Promise<boolean> // delete one of them; false if there is none
   compact(options: { history: IConversationTurn[]; signal?: AbortSignal; force?: boolean }): Promise<{
     history: IConversationTurn[]
     summary?: string
@@ -657,7 +686,7 @@ dd-agent --env-file=.env
 
 `--env-file=<path>` is loaded via Node's built-in `process.loadEnvFile`, so no `dotenv` dependency is needed. Without the flag the CLI reads the ambient process env. `-h` / `--help` prints the supported flags and the in-REPL slash commands (`/status`, `/tools`, `/history`, `/reset`, `/compact`, `/autopilot`, `/approval <mode>`, `/reconnect`, `/agents`, `/stop`, `/exit`).
 
-The newer features are env-driven too: `AGENT_THINKING` (`off | minimal | low | medium | high | xhigh | <budget tokens>`), `AGENT_MAX_INPUT_TOKENS` / `AGENT_MAX_OUTPUT_TOKENS` / `AGENT_MAX_REASONING_TOKENS` / `AGENT_MAX_TOTAL_TOKENS`, `AGENT_MAX_TOOL_CALLS`, `AGENT_TOOL_APPROVAL` (`autopilot | ask-writes | ask-all | read-only`), `AGENT_TOOL_RULES` (JSON `{ "<tool or glob*>": "allow" | "ask" | "deny" }`, beats the mode — e.g. `{"github__delete_*":"deny"}`), `AGENT_EGRESS` (`on | off`; with `AGENT_EGRESS_ALLOW`, `AGENT_EGRESS_DENY`, `AGENT_EGRESS_PROTOCOLS`, `AGENT_EGRESS_ALLOW_PRIVATE` — see [Egress](#egress-what-the-model-may-fetch)), `AGENT_SKILLS_DIR`, `AGENT_TOOL_SELECTION_STRATEGY` (`auto | all | plan-narrowed | search`), `AGENT_CONTEXT_WINDOW_TOKENS` and `AGENT_COMPACTION=off`. The REPL prints the model's thoughts dimmed, auto-compacts its history with the same settings, and — when the approval mode asks — prompts `allow? [y]es / [n]o / [a]lways` right in the terminal; `/autopilot` toggles between autopilot and the last asking mode.
+The newer features are env-driven too: `AGENT_THINKING` (`off | minimal | low | medium | high | xhigh | <budget tokens>`), `AGENT_MAX_INPUT_TOKENS` / `AGENT_MAX_OUTPUT_TOKENS` / `AGENT_MAX_REASONING_TOKENS` / `AGENT_MAX_TOTAL_TOKENS`, `AGENT_MAX_TOOL_CALLS`, `AGENT_TOOL_APPROVAL` (`autopilot | ask-writes | ask-all | read-only`), `AGENT_TOOL_RULES` (JSON `{ "<tool or glob*>": "allow" | "ask" | "deny" }`, beats the mode — e.g. `{"github__delete_*":"deny"}`), `AGENT_EGRESS` (`on | off`; with `AGENT_EGRESS_ALLOW`, `AGENT_EGRESS_DENY`, `AGENT_EGRESS_PROTOCOLS`, `AGENT_EGRESS_ALLOW_PRIVATE` — see [Egress](#egress-what-the-model-may-fetch)), `AGENT_SKILLS_DIR`, `AGENT_LEARNING` (`on | off`; `AGENT_LEARNING_DIR` keeps the lessons across sessions — see [Learning](#learning-lessons-that-outlive-the-task)), `AGENT_TOOL_SELECTION_STRATEGY` (`auto | all | plan-narrowed | search`), `AGENT_CONTEXT_WINDOW_TOKENS` and `AGENT_COMPACTION=off`. The REPL prints the model's thoughts dimmed, auto-compacts its history with the same settings, and — when the approval mode asks — prompts `allow? [y]es / [n]o / [a]lways` right in the terminal; `/autopilot` toggles between autopilot and the last asking mode.
 
 **Talking to the agent while it works.** The REPL keeps reading while a run goes. Text you type then is said to the running agent (it sees it at its next boundary and the replanner re-checks the plan — see [Steering a run](#steering-a-run-that-is-already-going)): the REPL prints `[you->agent] queued` and then `delivered (round|step|final)`, and the message enters the history as a user turn. A message that arrives while the answer is being written is sent as the next prompt (`[follow-up]`). After Ctrl-C nothing is sent behind your back: what the agent never saw is listed as `[not delivered]`. While a run goes, `/agents` lists the running subagents and `/stop <n>` (or an id prefix, or just `/stop` when one runs) stops one — the run goes on; the other REPL commands work between runs. Each subagent's own steps and tool calls are logged as `[name id] ...` lines, so parallel ones can be told apart.
 

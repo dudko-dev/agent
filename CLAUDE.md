@@ -17,6 +17,10 @@
     `context-editing.ts` (stale tool results → stubs inside a step's loop),
     `subagent.ts` + `subagent-worker.ts` (worker entry, built to
     `dist/subagent-worker.js`).
+  - `learning.ts` (`config.learning`: `save_skill` / `forget_skill` write the agent's own lessons
+    as skills, `origin.kind: 'learned'`; Memory/Dir stores; secret scan, caps, operator skills
+    never overwritten). Knowledge only, never policy: a lesson is loaded under `learnedPreamble`.
+    Every guard has a test in `tests/learning*.test.ts` and a mutation check.
   - `safe-fetch.ts` (`createSafeFetch`: own DNS lookup inside the connect, private / metadata
     ranges refused, allow/deny, redirects re-judged, size/time bounded) + `web-fetch.ts` (the
     `web_fetch` tool that `config.egress` switches on). Security boundary: every change needs a

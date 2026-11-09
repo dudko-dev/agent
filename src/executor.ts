@@ -6,6 +6,7 @@ import { stageCallOptions } from './call-options.ts'
 import type { IAgentInternalContext } from './internal.ts'
 import { hasTokenLimits, limitsStopCondition, resolveLimits } from './limits.ts'
 import { effectiveToolStrategy } from './planner.ts'
+import { WEB_FETCH_TOOL } from './web-fetch.ts'
 import { buildExecutorUserPrompt, composeExecutorSystem, renderUserMessages } from './prompts.ts'
 import { stageEmitsThoughts } from './thinking.ts'
 import { MAX_CARRIED_DISCOVERED_TOOLS } from './tool-search.ts'
@@ -126,7 +127,7 @@ export const buildExecutorTools = (
   if (strategy === 'search') {
     const tools: ToolSet = { ...ctx.tools, ...builtins, ...(ctx.findTools ?? {}) }
     const active = new Set<string>([...Object.keys(builtins), ...Object.keys(ctx.findTools ?? {})])
-    for (const name of step.suggestedTools ?? []) {
+    for (const name of [...(step.suggestedTools ?? []), ...(ctx.learning?.tools ?? [])]) {
       if (ctx.tools[name]) {
         active.add(name)
       }
@@ -138,7 +139,17 @@ export const buildExecutorTools = (
     }
     return { tools, active }
   }
-  const base = buildActiveToolSet(ctx, step)
+  const narrowed = buildActiveToolSet(ctx, step)
+  // The notebook's tools are not the plan's to hand out: a narrowed step still gets them.
+  const base: ToolSet =
+    strategy === 'plan-narrowed' && ctx.learning?.tools.length
+      ? {
+          ...narrowed,
+          ...Object.fromEntries(
+            ctx.learning.tools.filter((n) => ctx.tools[n]).map((n) => [n, ctx.tools[n]]),
+          ),
+        }
+      : narrowed
   const tools: ToolSet = Object.keys(builtins).length ? { ...base, ...builtins } : base
   // Defence-in-depth: explicitly tell the SDK which tools are callable in
   // this step. Only worth it in narrowed mode; in 'all' mode it's just a
@@ -223,6 +234,7 @@ const runOnce = async (
       activeSkills: run?.activeSkills,
       searchMode: Boolean(active),
       toolCount: ctx.toolCatalog.length,
+      ...(ctx.learning?.nudge ? { learning: { fetch: Boolean(ctx.tools[WEB_FETCH_TOOL]) } } : {}),
     }),
   )
   const emitThoughts = stageEmitsThoughts(ctx.config, 'executor')

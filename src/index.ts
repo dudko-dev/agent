@@ -47,6 +47,17 @@ export { buildInstructions, resolvePromptCaching, withRollingBreakpoint } from '
 export { createToolResultClearer } from './context-editing.ts'
 export type { IClearedInfo, IToolResultClearing } from './context-editing.ts'
 // Subagents
+// Learning: the agent's notebook of lessons (skills it wrote itself).
+export {
+  createLearning,
+  DirSkillStore,
+  MemorySkillStore,
+  findSecret,
+  normalizeSkillName,
+  SAVE_SKILL_TOOL,
+  FORGET_SKILL_TOOL,
+} from './learning.ts'
+export type { ILearning, ISaveSkillInput } from './learning.ts'
 // Egress: the fetch a model may use, and the safe fetch behind it.
 export {
   createSafeFetch,
@@ -83,6 +94,9 @@ export type {
   IPersistence,
   IRunSnapshot,
   ISkill,
+  ISkillOrigin,
+  ISkillStore,
+  ILearningConfig,
   IStepStartInfo,
   IPlan,
   IPlanStep,

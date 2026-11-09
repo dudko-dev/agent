@@ -1,4 +1,5 @@
 import { isSummaryTurn } from './compaction.ts'
+import { SAVE_SKILL_TOOL } from './learning.ts'
 import { renderActiveSkills, renderSkillsIndex } from './skills.ts'
 import { FIND_TOOLS_TOOL, renderSearchCatalog } from './tool-search.ts'
 import type {
@@ -283,14 +284,25 @@ const EXECUTOR_SKILLS_NOTE = `
 SKILLS:
 Packaged instructions for specific kinds of work. When one of these applies to the current step and is not active yet, call load_skill with its name before doing the work; read_skill_file reads files it bundles.`
 
+// Only in the system prompt of an agent with config.learning: runs without it send what they always did.
+const learningNote = (fetch: boolean): string =>
+  `\n\nLEARNING:\nYou keep a notebook of lessons that outlive this task. When you hit a problem and find the way around it - a tool error you resolved, a wrong assumption you corrected, a procedure you had to look up - call ${SAVE_SKILL_TOOL} once - before you give your answer - with a short name, when it applies, and what to do next time starting from the approach that works, so the problem does not happen at all (never secrets). ` +
+  `If a skill in the SKILLS list covers what you are about to do, load it first. ` +
+  `When you are stuck and do not know the fix, look for it before giving up${fetch ? ' (web_fetch can read documentation)' : ''}.`
+
 export const composeExecutorSystem = (
-  parts: ISystemParts & { searchMode?: boolean; toolCount?: number },
+  parts: ISystemParts & {
+    searchMode?: boolean
+    toolCount?: number
+    learning?: { fetch: boolean }
+  },
 ): string =>
   withDomainContext(EXECUTOR_SYSTEM, parts.domain) +
   (parts.skills?.length ? `${EXECUTOR_SKILLS_NOTE}\n${renderSkillsIndex(parts.skills)}` : '') +
   (parts.searchMode
     ? `${EXECUTOR_SEARCH_NOTE}${parts.toolCount ? ` The catalogue has ${parts.toolCount} tools.` : ''}`
     : '') +
+  (parts.learning ? learningNote(parts.learning.fetch) : '') +
   activeSkillsSection(parts.skills, parts.activeSkills)
 
 const quoted = (text: string): string => text.trim().replace(/\n/g, '\n  ')

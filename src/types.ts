@@ -131,6 +131,41 @@ export interface ISkill {
   content: string
   // Bundled text resources, skill-relative POSIX paths.
   files?: { path: string; content: string }[]
+  // Set on a skill the AGENT wrote (config.learning); absent on the operator's own.
+  origin?: ISkillOrigin
+}
+
+// Where a learned skill came from.
+export interface ISkillOrigin {
+  kind: 'learned'
+  // Epoch ms of the last write.
+  at: number
+  // 1 for a new lesson, +1 each time the agent rewrites it.
+  revision: number
+  runId?: string
+  // What the model said it consulted (URLs without query strings, doc names).
+  sources?: string[]
+  // Pages web_fetch read during the run that wrote it - recorded by the harness, not the model.
+  fetched?: string[]
+}
+
+// Where learned skills are kept. MemorySkillStore (the open session) and DirSkillStore (a folder
+// of SKILL.md files) are provided; bring your own for a database.
+export interface ISkillStore {
+  list: () => ISkill[] | Promise<ISkill[]>
+  save: (skill: ISkill) => void | Promise<void>
+  remove: (name: string) => boolean | Promise<boolean>
+}
+
+export interface ILearningConfig {
+  // Default: a MemorySkillStore - lessons last as long as the agent.
+  store?: ISkillStore
+  // Cap on lessons (default 50).
+  maxSkills?: number
+  // Cap on one lesson's instructions, in characters (default 6000).
+  maxSkillChars?: number
+  // Add the "write down what you learned" guidance to the executor's prompt (default true).
+  nudge?: boolean
 }
 
 // How tool calls are consented:
@@ -284,6 +319,11 @@ export interface IAgentConfig {
   // ranges refused, redirects re-checked, size and time bounded. It does not govern the provider's
   // own API calls or the MCP servers you configure - those are your configuration, not the model's.
   egress?: boolean | IEgressPolicy
+  // Let the agent keep a notebook: it writes lessons it learned (problem -> what worked) as skills,
+  // visible in the SKILLS index and loadable for the rest of the session. `true` = in memory (as
+  // long as the agent lives); give a store to keep them (DirSkillStore). Saving is a write for
+  // tool approval. Knowledge only - never policy. See src/learning.ts.
+  learning?: boolean | ILearningConfig
   // Native AI-SDK tools registered alongside MCP-discovered tools. Names
   // must not collide with any MCP-prefixed tool ("server__tool"); createAgent
   // throws on conflict. Native tools bypass outputSanitizer/inputSanitizer
@@ -530,6 +570,16 @@ type AgentEventBody =
   // A request of the web_fetch tool: allowed or refused by the egress policy. `url` is origin and
   // path only (a query string can carry a secret).
   | { type: 'egress.request'; url: string; allowed: boolean; status?: number; reason?: string }
+  // The agent wrote (or rewrote) a lesson. `sources` = what it named plus the pages fetched that run.
+  | {
+      type: 'skill.learned'
+      name: string
+      description: string
+      update: boolean
+      chars: number
+      sources: string[]
+    }
+  | { type: 'skill.forgotten'; name: string }
   | { type: 'revisions.exceeded'; cap: number }
   | { type: 'error'; error: Error; phase: 'plan' | 'execute' | 'replan' | 'synthesize' | 'init' }
 

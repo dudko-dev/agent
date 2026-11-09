@@ -6,6 +6,7 @@ import type { IAgentInternalContext } from './internal.ts'
 import { connectMcpServers, filterTools } from './mcp.ts'
 import { buildModelFromStage, resolveStage } from './provider.ts'
 import { runAgentLoop } from './runner.ts'
+import { createLearning } from './learning.ts'
 import { createSkillTools, validateSkills } from './skills.ts'
 import { createEgressTools } from './web-fetch.ts'
 import { createFindToolsTool, FIND_TOOLS_TOOL } from './tool-search.ts'
@@ -17,6 +18,7 @@ import type {
   IAgentRunOptions,
   IAgentRunResult,
   IConversationTurn,
+  ISkill,
   IToolCatalogEntry,
   LogLevel,
   ToolApprovalMode,
@@ -61,8 +63,12 @@ export interface IAgent {
   run: (options: IAgentRunOptions) => Promise<IAgentRunResult>
   // The filtered tool catalogue (MCP + native; built-ins excluded).
   listTools: () => IToolCatalogEntry[]
-  // Configured skills (name + description).
-  listSkills: () => { name: string; description: string }[]
+  // Skills (name + description); `learned` marks the ones the agent wrote itself.
+  listSkills: () => { name: string; description: string; learned?: true }[]
+  // The agent's own lessons (config.learning), with where each came from.
+  listLearnedSkills: () => ISkill[]
+  // Delete one of them (e.g. from a UI). false when there is no such learned skill.
+  forgetSkill: (name: string) => Promise<boolean>
   // Summarise all but the most recent turns of a history into one summary
   // turn (the synthesizer model writes it). Never throws; the input array is
   // never mutated. Without `force`, only above the compaction threshold.
@@ -139,12 +145,23 @@ export const createAgent = async (
     maxToolCalls: config.maxToolCalls,
     maxToolOutputChars: compaction.maxToolOutputChars,
   }
-  const builtinTools = wrapToolSet(createSkillTools(skills), wrapDeps, { builtIn: true })
+  // The agent's notebook: lessons it writes join `skills` (mutated in place) and are tools of its own.
+  const learning = config.learning
+    ? await createLearning(config.learning === true ? {} : config.learning, skills, emit, (m) =>
+        log('warn', m),
+      )
+    : undefined
+  const builtinTools = wrapToolSet(
+    createSkillTools(skills, { live: Boolean(learning) }),
+    wrapDeps,
+    {
+      builtIn: true,
+    },
+  )
   // What config.egress switches on (web_fetch). A tool of the same name in config.tools wins.
   const egressTools = createEgressTools(config.egress)
-  const nativeTools: ToolSet | undefined = egressTools
-    ? { ...egressTools, ...config.tools }
-    : config.tools
+  const nativeTools: ToolSet | undefined =
+    egressTools || learning ? { ...egressTools, ...learning?.tools, ...config.tools } : config.tools
   // find_tools exists whenever the strategy can resolve to 'search'.
   const strategy = config.toolSelectionStrategy ?? 'auto'
   const searchPossible = strategy === 'search' || strategy === 'auto'
@@ -357,7 +374,15 @@ export const createAgent = async (
     toolCatalog: toEntries(connected.catalog),
     emit,
     ...(Object.keys(builtinTools).length ? { builtinTools } : {}),
-    ...(skills.length ? { skills } : {}),
+    ...(skills.length || learning ? { skills } : {}),
+    ...(learning
+      ? {
+          learning: {
+            nudge: typeof config.learning === 'object' ? config.learning.nudge !== false : true,
+            tools: Object.keys(learning.tools),
+          },
+        }
+      : {}),
     approval,
   }
   // Read through ctx so find_tools always searches the live catalogue
@@ -481,7 +506,14 @@ export const createAgent = async (
       }
     },
     listTools: () => ctx.toolCatalog.map((t) => ({ ...t })),
-    listSkills: () => skills.map((s) => ({ name: s.name, description: s.description })),
+    listSkills: () =>
+      skills.map((s) => ({
+        name: s.name,
+        description: s.description,
+        ...(s.origin ? { learned: true as const } : {}),
+      })),
+    listLearnedSkills: () => (learning ? learning.learned().map((s) => ({ ...s })) : []),
+    forgetSkill: async (name: string) => (learning ? learning.forget(name) : false),
     compact: async (options: ICompactOptions): Promise<ICompactResult> => {
       const r = await compactHistory(options.history, ctx.synthesizerModel, {
         thresholdTokens: compaction.thresholdTokens,
