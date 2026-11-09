@@ -1,6 +1,6 @@
 import { generateObject } from 'ai'
 import { z } from 'zod'
-import { stageCallOptions } from './call-options.ts'
+import { stageCallOptions, withCapHint } from './call-options.ts'
 import type { IAgentInternalContext } from './internal.ts'
 import { PlanSchema, catalogModeFor, effectiveToolStrategy } from './planner.ts'
 import { buildReplannerUserPrompt, composeReplannerSystem } from './prompts.ts'
@@ -70,6 +70,8 @@ export const decideNextAction = async (
             newUpdates,
           ),
           abortSignal: withTimeout(signal, ctx.config.llmTimeoutMs ?? 0),
+        }).catch((err) => {
+          throw withCapHint(err, ctx.config, 'replanner')
         })
         const usage: IUsage = normalizeUsage(r.usage)
         return { object: r.object, usage }

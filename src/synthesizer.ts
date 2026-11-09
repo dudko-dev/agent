@@ -1,5 +1,5 @@
 import { streamText } from 'ai'
-import { stageCallOptions } from './call-options.ts'
+import { outputCapNotice, stageCallOptions } from './call-options.ts'
 import type { IAgentInternalContext } from './internal.ts'
 import { buildSynthesizerUserPrompt, composeSynthesizerSystem } from './prompts.ts'
 import { stageEmitsThoughts } from './thinking.ts'
@@ -80,6 +80,14 @@ const streamOnce = async (
     }
   }
 
-  const [text, rawUsage] = await Promise.all([result.text, result.usage])
+  const [text, rawUsage, finishReason] = await Promise.all([
+    result.text,
+    result.usage,
+    result.finishReason,
+  ])
+  const cut = outputCapNotice(ctx.config, 'synthesizer', finishReason)
+  if (cut) {
+    ctx.emit({ type: 'log', level: 'warn', message: cut })
+  }
   return { text, usage: normalizeUsage(rawUsage) }
 }

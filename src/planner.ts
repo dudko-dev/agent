@@ -1,6 +1,6 @@
 import { streamObject } from 'ai'
 import { z } from 'zod'
-import { stageCallOptions } from './call-options.ts'
+import { stageCallOptions, withCapHint } from './call-options.ts'
 import type { EffectiveToolStrategy, IAgentInternalContext } from './internal.ts'
 import {
   DEFAULT_PLAN_STEP_CAP,
@@ -228,6 +228,8 @@ const streamPlanOnce = async (
       }
     }
   }
-  const [object, rawUsage] = await Promise.all([result.object, result.usage])
+  const [object, rawUsage] = await Promise.all([result.object, result.usage]).catch((err) => {
+    throw withCapHint(err, ctx.config, 'planner')
+  })
   return { object, usage: normalizeUsage(rawUsage) }
 }
