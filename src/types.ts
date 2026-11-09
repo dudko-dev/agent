@@ -2,6 +2,7 @@ import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js'
 import type { ToolSet } from 'ai'
 import type { RunControl } from './control.ts'
+import type { IEgressPolicy } from './safe-fetch.ts'
 
 export type ProviderType =
   | 'openai'
@@ -277,6 +278,12 @@ export interface IAgentConfig {
   /** @deprecated use `synthesizer: { model }` */
   synthesizerModel?: string
   mcpServers: Record<string, IMcpServerConfig>
+  // Outbound requests the MODEL may make (the web_fetch tool). Off unless set. `true` = any public
+  // host over https; an object narrows or widens that (allow / deny lists, private networks, ...)
+  // - see IEgressPolicy. Requests go through createSafeFetch: own DNS lookup, private / metadata
+  // ranges refused, redirects re-checked, size and time bounded. It does not govern the provider's
+  // own API calls or the MCP servers you configure - those are your configuration, not the model's.
+  egress?: boolean | IEgressPolicy
   // Native AI-SDK tools registered alongside MCP-discovered tools. Names
   // must not collide with any MCP-prefixed tool ("server__tool"); createAgent
   // throws on conflict. Native tools bypass outputSanitizer/inputSanitizer
@@ -520,6 +527,9 @@ type AgentEventBody =
   // 'step' = at a step boundary, where it forces the replanner to look at the plan;
   // 'final' = just before the answer is written.
   | { type: 'message.delivered'; id: string; text: string; at: 'round' | 'step' | 'final' }
+  // A request of the web_fetch tool: allowed or refused by the egress policy. `url` is origin and
+  // path only (a query string can carry a secret).
+  | { type: 'egress.request'; url: string; allowed: boolean; status?: number; reason?: string }
   | { type: 'revisions.exceeded'; cap: number }
   | { type: 'error'; error: Error; phase: 'plan' | 'execute' | 'replan' | 'synthesize' | 'init' }
 

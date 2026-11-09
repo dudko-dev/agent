@@ -44,6 +44,10 @@ Optional env vars (see env.example for the full list):
   AGENT_TOOL_APPROVAL         autopilot | ask-writes | ask-all | read-only
   AGENT_TOOL_RULES            JSON: { "<tool or glob*>": "allow" | "ask" | "deny" } - beats the mode
   AGENT_SKILLS_DIR            folder of <skill>/SKILL.md skills
+  AGENT_EGRESS                on lets the model read the web (web_fetch); off (default) = no outbound requests
+  AGENT_EGRESS_ALLOW / _DENY  comma lists: host, *.host, IP or CIDR (deny wins; allow limits to these)
+  AGENT_EGRESS_PROTOCOLS      https (default) | http | https,http
+  AGENT_EGRESS_ALLOW_PRIVATE  on lets it reach private networks (cloud metadata stays refused)
   AGENT_CONTEXT_WINDOW_TOKENS model window (auto-compaction threshold = 50%)
   AGENT_COMPACTION            off disables automatic compaction
 

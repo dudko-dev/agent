@@ -493,6 +493,35 @@ and the run are untouched. Only a child that has started is listed; one still wa
 child stops them with it. What each child does is the `subagent.event` stream, the same events the
 parent emits.
 
+## Egress: what the model may fetch
+
+By default the agent has **no way to reach the network of its own**: its only outbound paths are the provider API and the MCP servers and tools *you* configure. To let the model read the web, switch on `egress`:
+
+```ts
+const agent = await createAgent({
+  // ...
+  egress: {
+    allow: ['docs.example.com', '*.github.com'], // optional: only these (then web_fetch counts as read-only)
+    deny: ['internal.example.com', '10.0.0.0/8'], // optional: always refused, wins over allow
+  },
+})
+// egress: true = any public host over https. CLI: AGENT_EGRESS=on, AGENT_EGRESS_ALLOW, AGENT_EGRESS_DENY, ...
+```
+
+That registers one tool, `web_fetch({ url, maxChars? })`: a GET that returns the page as readable text (HTML reduced, JSON and text as they are), flagged `untrusted: true` — facts to use, never instructions. Every request goes through **`createSafeFetch`**, which you can also use on its own (it is a drop-in `fetch`, e.g. for an MCP transport):
+
+- **Its own DNS lookup, inside the connect.** The addresses that were checked are the addresses that are connected to, so DNS rebinding has nowhere to hide. A name with *any* unacceptable address is refused whole.
+- **Refused by default:** loopback, private networks, link-local, CGNAT, multicast, reserved and documentation ranges, and **cloud metadata endpoints** (`169.254.169.254`, `fd00:ec2::254`, Alibaba, Oracle). IPv4 hidden in IPv6 (mapped, NAT64, 6to4, compatible) is judged as the IPv4 it is; the URL parser's tricks (`2130706433`, `0x7f.1`, `127.1`) are normalized first. `allowPrivateNetwork: true` opens the private ranges for an intranet agent — metadata and the never-routable ranges stay refused.
+- **Allow / deny** by host (`example.com`, `*.example.com` — subdomains, not the apex), IP or CIDR; deny wins; an allow list is exclusive. A deny CIDR also applies to what a *name* resolves to.
+- **https only, port 443, GET/HEAD**, no credentials in URLs — widen with `protocols`, `ports`, `methods`.
+- **Redirects** are followed up to `maxRedirects` (3), **each hop judged again**, never from https to http, credentials dropped across origins.
+- **Bounded:** `timeoutMs` (15 s) for the whole request, `maxResponseBytes` (2 MB) on what is read *after decompression* (a small gzip cannot unpack into the heap).
+- Certificates are always verified; `ca` adds a CA to trust (an internal one).
+
+Approval: an open-internet `web_fetch` is a way to leak data through the URL, so it asks like a **write** (`ask-writes` prompts for it); with an `allow` list it is **read-only**. Each request emits `egress.request` (`url` is origin and path only — no query string — `allowed`, `status` / `reason`).
+
+What it is not: a sandbox for what a fetched *page says* — that stays data the model reads, which is why the result is flagged untrusted. And it does not govern the provider's own calls, or the MCP servers and tools you configure — those are your configuration, not the model's. A subagent has its own `egress` (none unless you set it). The browser sibling cannot pin DNS; see `@dudko.dev/agent-web`.
+
 ## Autonomy
 
 The stage prompts are written for an agent that acts on its own:
@@ -628,7 +657,7 @@ dd-agent --env-file=.env
 
 `--env-file=<path>` is loaded via Node's built-in `process.loadEnvFile`, so no `dotenv` dependency is needed. Without the flag the CLI reads the ambient process env. `-h` / `--help` prints the supported flags and the in-REPL slash commands (`/status`, `/tools`, `/history`, `/reset`, `/compact`, `/autopilot`, `/approval <mode>`, `/reconnect`, `/agents`, `/stop`, `/exit`).
 
-The newer features are env-driven too: `AGENT_THINKING` (`off | minimal | low | medium | high | xhigh | <budget tokens>`), `AGENT_MAX_INPUT_TOKENS` / `AGENT_MAX_OUTPUT_TOKENS` / `AGENT_MAX_REASONING_TOKENS` / `AGENT_MAX_TOTAL_TOKENS`, `AGENT_MAX_TOOL_CALLS`, `AGENT_TOOL_APPROVAL` (`autopilot | ask-writes | ask-all | read-only`), `AGENT_TOOL_RULES` (JSON `{ "<tool or glob*>": "allow" | "ask" | "deny" }`, beats the mode — e.g. `{"github__delete_*":"deny"}`), `AGENT_SKILLS_DIR`, `AGENT_TOOL_SELECTION_STRATEGY` (`auto | all | plan-narrowed | search`), `AGENT_CONTEXT_WINDOW_TOKENS` and `AGENT_COMPACTION=off`. The REPL prints the model's thoughts dimmed, auto-compacts its history with the same settings, and — when the approval mode asks — prompts `allow? [y]es / [n]o / [a]lways` right in the terminal; `/autopilot` toggles between autopilot and the last asking mode.
+The newer features are env-driven too: `AGENT_THINKING` (`off | minimal | low | medium | high | xhigh | <budget tokens>`), `AGENT_MAX_INPUT_TOKENS` / `AGENT_MAX_OUTPUT_TOKENS` / `AGENT_MAX_REASONING_TOKENS` / `AGENT_MAX_TOTAL_TOKENS`, `AGENT_MAX_TOOL_CALLS`, `AGENT_TOOL_APPROVAL` (`autopilot | ask-writes | ask-all | read-only`), `AGENT_TOOL_RULES` (JSON `{ "<tool or glob*>": "allow" | "ask" | "deny" }`, beats the mode — e.g. `{"github__delete_*":"deny"}`), `AGENT_EGRESS` (`on | off`; with `AGENT_EGRESS_ALLOW`, `AGENT_EGRESS_DENY`, `AGENT_EGRESS_PROTOCOLS`, `AGENT_EGRESS_ALLOW_PRIVATE` — see [Egress](#egress-what-the-model-may-fetch)), `AGENT_SKILLS_DIR`, `AGENT_TOOL_SELECTION_STRATEGY` (`auto | all | plan-narrowed | search`), `AGENT_CONTEXT_WINDOW_TOKENS` and `AGENT_COMPACTION=off`. The REPL prints the model's thoughts dimmed, auto-compacts its history with the same settings, and — when the approval mode asks — prompts `allow? [y]es / [n]o / [a]lways` right in the terminal; `/autopilot` toggles between autopilot and the last asking mode.
 
 **Talking to the agent while it works.** The REPL keeps reading while a run goes. Text you type then is said to the running agent (it sees it at its next boundary and the replanner re-checks the plan — see [Steering a run](#steering-a-run-that-is-already-going)): the REPL prints `[you->agent] queued` and then `delivered (round|step|final)`, and the message enters the history as a user turn. A message that arrives while the answer is being written is sent as the next prompt (`[follow-up]`). After Ctrl-C nothing is sent behind your back: what the agent never saw is listed as `[not delivered]`. While a run goes, `/agents` lists the running subagents and `/stop <n>` (or an id prefix, or just `/stop` when one runs) stops one — the run goes on; the other REPL commands work between runs. Each subagent's own steps and tool calls are logged as `[name id] ...` lines, so parallel ones can be told apart.
 

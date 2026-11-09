@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { beforeEach } from 'node:test'
 import { loadConfig, parseThinking, parseToolRules, skillsDirFromEnv } from '../src/cli/config.ts'
-import { decideToolPermission } from '../src/index.ts'
+import { decideToolPermission, type IEgressPolicy } from '../src/index.ts'
 
 const CONFIG_KEYS = [
   'AGENT_PROVIDER_TYPE',
@@ -41,6 +41,11 @@ const CONFIG_KEYS = [
   'AGENT_SKILLS_DIR',
   'AGENT_CONTEXT_WINDOW_TOKENS',
   'AGENT_COMPACTION',
+  'AGENT_EGRESS',
+  'AGENT_EGRESS_ALLOW',
+  'AGENT_EGRESS_DENY',
+  'AGENT_EGRESS_PROTOCOLS',
+  'AGENT_EGRESS_ALLOW_PRIVATE',
 ] as const
 
 beforeEach(() => {
@@ -354,4 +359,54 @@ test('AGENT_TOOL_RULES: refuses what it cannot trust, loudly and at startup', ()
     assert.throws(() => loadConfig(), expected, `rejects ${raw}`)
     assert.throws(() => parseToolRules(raw), /AGENT_TOOL_RULES/)
   }
+})
+
+// ── AGENT_EGRESS: what the model may fetch ────────────────────────────────────
+
+test('AGENT_EGRESS: off by default - the agent has no way to reach the network of its own', () => {
+  setMinimalOpenAi()
+  assert.equal(loadConfig().egress, undefined)
+  process.env.AGENT_EGRESS = 'off'
+  assert.equal(loadConfig().egress, undefined)
+})
+
+test('AGENT_EGRESS: on enables it; the lists, protocols and private networks narrow or widen it', () => {
+  setMinimalOpenAi()
+  process.env.AGENT_EGRESS = 'on'
+  assert.deepEqual(loadConfig().egress, {}, 'on with nothing else: any public host over https')
+
+  process.env.AGENT_EGRESS_ALLOW = 'docs.example.com, *.github.com'
+  process.env.AGENT_EGRESS_DENY = '10.0.0.0/8,internal.example.com'
+  process.env.AGENT_EGRESS_PROTOCOLS = 'https,http'
+  process.env.AGENT_EGRESS_ALLOW_PRIVATE = 'on'
+  assert.deepEqual(loadConfig().egress, {
+    allow: ['docs.example.com', '*.github.com'],
+    deny: ['10.0.0.0/8', 'internal.example.com'],
+    protocols: ['https', 'http'],
+    allowPrivateNetwork: true,
+  })
+  process.env.AGENT_EGRESS_ALLOW_PRIVATE = 'off'
+  assert.equal((loadConfig().egress as IEgressPolicy).allowPrivateNetwork, undefined)
+})
+
+test('AGENT_EGRESS: a setting without the switch, or a typo, is an error - never a silent no-op', () => {
+  setMinimalOpenAi()
+  for (const key of [
+    'AGENT_EGRESS_ALLOW',
+    'AGENT_EGRESS_DENY',
+    'AGENT_EGRESS_PROTOCOLS',
+    'AGENT_EGRESS_ALLOW_PRIVATE',
+  ]) {
+    process.env[key] = key === 'AGENT_EGRESS_PROTOCOLS' ? 'https' : 'on'
+    assert.throws(() => loadConfig(), new RegExp(`${key} set but AGENT_EGRESS is off`), key)
+    delete process.env[key]
+  }
+  process.env.AGENT_EGRESS = 'maybe'
+  assert.throws(() => loadConfig(), /AGENT_EGRESS must be on \| off/)
+  process.env.AGENT_EGRESS = 'on'
+  process.env.AGENT_EGRESS_PROTOCOLS = 'ftp'
+  assert.throws(() => loadConfig(), /AGENT_EGRESS_PROTOCOLS must list https and\/or http/)
+  delete process.env.AGENT_EGRESS_PROTOCOLS
+  process.env.AGENT_EGRESS_ALLOW_PRIVATE = 'sure'
+  assert.throws(() => loadConfig(), /AGENT_EGRESS_ALLOW_PRIVATE must be on \| off/)
 })

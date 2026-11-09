@@ -2,6 +2,7 @@ import type {
   IAgentConfig,
   IAgentStageOverride,
   ICompactionConfig,
+  IEgressPolicy,
   IMcpServerConfig,
   ITokenLimits,
   IToolApprovalConfig,
@@ -93,6 +94,7 @@ export const loadConfig = (): IAgentConfig => {
     thinking: parseThinking(process.env.AGENT_THINKING),
     toolApproval: parseApproval(process.env.AGENT_TOOL_APPROVAL, process.env.AGENT_TOOL_RULES),
     compaction: parseCompaction(),
+    egress: parseEgress(),
     llmTimeoutMs: parseOptionalInt(process.env.AGENT_LLM_TIMEOUT_MS),
     llmMaxRetries: parseOptionalInt(process.env.AGENT_LLM_MAX_RETRIES),
     toolSelectionStrategy: parseToolStrategy(process.env.AGENT_TOOL_SELECTION_STRATEGY),
@@ -195,6 +197,53 @@ const parseApproval = (
     return undefined
   }
   return { ...(v ? { mode: v as ToolApprovalMode } : {}), ...(rules ? { rules } : {}) }
+}
+
+// AGENT_EGRESS=on lets the model read the web (the web_fetch tool); off (the default) means no
+// outbound requests of its own. The rest narrows it: AGENT_EGRESS_ALLOW / AGENT_EGRESS_DENY
+// (comma lists: "docs.example.com", "*.example.com", an IP or a CIDR), AGENT_EGRESS_PROTOCOLS
+// (https | http), AGENT_EGRESS_ALLOW_PRIVATE=on (reach private networks - cloud metadata stays
+// refused). Setting any of them while AGENT_EGRESS is off is an error, not a silent no-op.
+export const parseEgress = (env: NodeJS.ProcessEnv = process.env): IEgressPolicy | undefined => {
+  const raw = env.AGENT_EGRESS?.trim().toLowerCase()
+  const on = raw !== undefined && ['on', 'true', '1', 'yes'].includes(raw)
+  if (raw && !on && !['off', 'false', '0', 'no'].includes(raw)) {
+    throw new Error(`AGENT_EGRESS must be on | off, got: ${env.AGENT_EGRESS}`)
+  }
+  const allow = parseList(env.AGENT_EGRESS_ALLOW)
+  const deny = parseList(env.AGENT_EGRESS_DENY)
+  const protocols = parseList(env.AGENT_EGRESS_PROTOCOLS)
+  const priv = env.AGENT_EGRESS_ALLOW_PRIVATE?.trim().toLowerCase()
+  if (!on) {
+    const stray = [
+      allow && 'AGENT_EGRESS_ALLOW',
+      deny && 'AGENT_EGRESS_DENY',
+      protocols && 'AGENT_EGRESS_PROTOCOLS',
+      priv && 'AGENT_EGRESS_ALLOW_PRIVATE',
+    ].filter(Boolean)
+    if (stray.length) {
+      throw new Error(
+        `${stray.join(', ')} set but AGENT_EGRESS is off - set AGENT_EGRESS=on to use it`,
+      )
+    }
+    return undefined
+  }
+  for (const p of protocols ?? []) {
+    if (p !== 'https' && p !== 'http') {
+      throw new Error(`AGENT_EGRESS_PROTOCOLS must list https and/or http, got: ${p}`)
+    }
+  }
+  if (priv && !['on', 'true', '1', 'yes', 'off', 'false', '0', 'no'].includes(priv)) {
+    throw new Error(
+      `AGENT_EGRESS_ALLOW_PRIVATE must be on | off, got: ${env.AGENT_EGRESS_ALLOW_PRIVATE}`,
+    )
+  }
+  return {
+    ...(allow ? { allow } : {}),
+    ...(deny ? { deny } : {}),
+    ...(protocols ? { protocols: protocols as ('https' | 'http')[] } : {}),
+    ...(priv && ['on', 'true', '1', 'yes'].includes(priv) ? { allowPrivateNetwork: true } : {}),
+  }
 }
 
 // AGENT_COMPACTION=off disables automatic compaction (the /compact command

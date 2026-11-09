@@ -7,6 +7,7 @@ import { connectMcpServers, filterTools } from './mcp.ts'
 import { buildModelFromStage, resolveStage } from './provider.ts'
 import { runAgentLoop } from './runner.ts'
 import { createSkillTools, validateSkills } from './skills.ts'
+import { createEgressTools } from './web-fetch.ts'
 import { createFindToolsTool, FIND_TOOLS_TOOL } from './tool-search.ts'
 import { wrapToolSet, type IToolWrapDeps } from './tool-wrap.ts'
 import type {
@@ -139,6 +140,11 @@ export const createAgent = async (
     maxToolOutputChars: compaction.maxToolOutputChars,
   }
   const builtinTools = wrapToolSet(createSkillTools(skills), wrapDeps, { builtIn: true })
+  // What config.egress switches on (web_fetch). A tool of the same name in config.tools wins.
+  const egressTools = createEgressTools(config.egress)
+  const nativeTools: ToolSet | undefined = egressTools
+    ? { ...egressTools, ...config.tools }
+    : config.tools
   // find_tools exists whenever the strategy can resolve to 'search'.
   const strategy = config.toolSelectionStrategy ?? 'auto'
   const searchPossible = strategy === 'search' || strategy === 'auto'
@@ -195,11 +201,11 @@ export const createAgent = async (
     tools: ReturnType<typeof filterTools>['tools']
     catalog: ReturnType<typeof filterTools>['catalog']
   } => {
-    if (!config.tools) {
+    if (!nativeTools) {
       return f
     }
     const nativeCatalog: ReturnType<typeof filterTools>['catalog'] = []
-    for (const [name, tool] of Object.entries(config.tools)) {
+    for (const [name, tool] of Object.entries(nativeTools)) {
       if (f.tools[name]) {
         onCollision(name)
       }

@@ -47,6 +47,18 @@ export { buildInstructions, resolvePromptCaching, withRollingBreakpoint } from '
 export { createToolResultClearer } from './context-editing.ts'
 export type { IClearedInfo, IToolResultClearing } from './context-editing.ts'
 // Subagents
+// Egress: the fetch a model may use, and the safe fetch behind it.
+export {
+  createSafeFetch,
+  EgressError,
+  classifyAddress,
+  checkEgressUrl,
+  checkRedirect,
+  hostMatches,
+  resolveEgressPolicy,
+} from './safe-fetch.ts'
+export type { EgressErrorCode, IEgressPolicy, IResolvedAddress, SafeFetch } from './safe-fetch.ts'
+export { createWebFetchTool, createEgressTools, htmlToText, WEB_FETCH_TOOL } from './web-fetch.ts'
 // Steer a run while it goes: send a message, stop one subagent.
 export { createRunControl } from './control.ts'
 export type { RunControl, SubagentInfo } from './control.ts'
