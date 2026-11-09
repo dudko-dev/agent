@@ -8,8 +8,8 @@ import {
   stageOutputCap,
   withCapHint,
 } from '../src/call-options.ts'
-import { createAgent } from '../src/index.ts'
-import type { AgentEvent, AgentStage, IAgent, IAgentConfig } from '../src/types.ts'
+import { createAgent, type AgentEvent, type IAgent, type IAgentConfig } from '../src/index.ts'
+import type { AgentStage } from '../src/types.ts'
 import {
   startLocalOpenAI,
   systemOf,

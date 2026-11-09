@@ -129,10 +129,55 @@ export const parseThinking = (raw: string | undefined): ThinkingSetting | undefi
   )
 }
 
-// AGENT_MAX_INPUT_TOKENS / AGENT_MAX_OUTPUT_TOKENS / AGENT_MAX_REASONING_TOKENS.
+const PER_CALL_STAGES = ['planner', 'executor', 'replanner', 'synthesizer', 'compaction'] as const
+
+// AGENT_PER_CALL_TOKENS: a JSON object of per-stage output caps, e.g.
+// {"executor":16000,"synthesizer":0}. A stage left out keeps its default (a share of the context
+// window); 0 means no cap at all. Validated eagerly: a typo such as "sythesizer" silently leaving
+// the default in force is the failure this prevents.
+export const parsePerCallTokens = (
+  raw: string | undefined,
+): NonNullable<ITokenLimits['perCall']> | undefined => {
+  const v = raw?.trim()
+  if (!v) {
+    return undefined
+  }
+  const usage = `AGENT_PER_CALL_TOKENS must be a JSON object of ${PER_CALL_STAGES.join(' | ')} to a token count (0 = no cap), e.g. {"executor":16000}`
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(v)
+  } catch {
+    throw new Error(usage)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(usage)
+  }
+  const perCall: NonNullable<ITokenLimits['perCall']> = {}
+  for (const [stage, tokens] of Object.entries(parsed)) {
+    if (!PER_CALL_STAGES.includes(stage as (typeof PER_CALL_STAGES)[number])) {
+      throw new Error(
+        `AGENT_PER_CALL_TOKENS: unknown stage "${stage}"; use ${PER_CALL_STAGES.join(' | ')}`,
+      )
+    }
+    if (typeof tokens !== 'number' || !Number.isInteger(tokens) || tokens < 0) {
+      throw new Error(
+        `AGENT_PER_CALL_TOKENS["${stage}"] must be a whole number of tokens (0 = no cap), got: ${JSON.stringify(tokens)}`,
+      )
+    }
+    perCall[stage as (typeof PER_CALL_STAGES)[number]] = tokens
+  }
+  return Object.keys(perCall).length ? perCall : undefined
+}
+
+// AGENT_MAX_INPUT_TOKENS / AGENT_MAX_OUTPUT_TOKENS / AGENT_MAX_REASONING_TOKENS, and the per-call
+// output caps in AGENT_PER_CALL_TOKENS.
 // (AGENT_MAX_TOTAL_TOKENS keeps feeding the legacy top-level maxTotalTokens.)
 const parseLimits = (): ITokenLimits | undefined => {
   const limits: ITokenLimits = {}
+  const perCall = parsePerCallTokens(process.env.AGENT_PER_CALL_TOKENS)
+  if (perCall) {
+    limits.perCall = perCall
+  }
   const input = parseOptionalInt(process.env.AGENT_MAX_INPUT_TOKENS)
   const output = parseOptionalInt(process.env.AGENT_MAX_OUTPUT_TOKENS)
   const reasoning = parseOptionalInt(process.env.AGENT_MAX_REASONING_TOKENS)
