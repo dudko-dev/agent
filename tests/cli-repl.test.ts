@@ -224,3 +224,32 @@ test('REPL: during a run a command is a hint, /agents says nothing runs, and Ctr
     await llm.close()
   }
 })
+
+test('REPL: /usage is what the session has spent so far; each answer shows the running total; /status shows where compaction starts', async () => {
+  // Every call reports 100 in / 20 out: a run of planner + step + answer is 360 tokens.
+  const script: Script = (req) =>
+    stageOf(req) === 'planner'
+      ? { text: planJson('a'), usage: { prompt: 100, completion: 20 } }
+      : {
+          text: stageOf(req) === 'executor' ? 'did a' : 'Done.',
+          usage: { prompt: 100, completion: 20 },
+        }
+  const llm = await startLocalOpenAI(script)
+  const repl = startRepl(llm)
+  try {
+    await repl.until(/you> /)
+    repl.say('/usage') // nothing spent yet
+    await repl.until(/\[usage\]\s+0 tokens \(in=0 out=0\) this session/)
+    repl.say('first')
+    await repl.until(/tokens=360 \(in=300 out=60\) session=360/)
+    repl.say('second')
+    await repl.until(/tokens=360 \(in=300 out=60\) session=720/)
+    repl.say('/usage')
+    await repl.until(/\[usage\]\s+720 tokens \(in=600 out=120\) this session/)
+    repl.say('/status')
+    await repl.until(/compaction=auto window=128000 at=108800/)
+  } finally {
+    await finish(repl).catch(() => repl.child.kill())
+    await llm.close()
+  }
+})

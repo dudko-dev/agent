@@ -10,6 +10,7 @@ import { createLearning } from './learning.ts'
 import { createSkillTools, validateSkills } from './skills.ts'
 import { createEgressTools } from './web-fetch.ts'
 import { createFindToolsTool, FIND_TOOLS_TOOL } from './tool-search.ts'
+import { accumulateUsage, normalizeUsage } from './utils.ts'
 import { wrapToolSet, type IToolWrapDeps } from './tool-wrap.ts'
 import type {
   AgentEvent,
@@ -20,6 +21,7 @@ import type {
   IConversationTurn,
   ISkill,
   IToolCatalogEntry,
+  IUsage,
   LogLevel,
   ToolApprovalMode,
 } from './types.ts'
@@ -63,6 +65,13 @@ export interface IAgent {
   run: (options: IAgentRunOptions) => Promise<IAgentRunResult>
   // The filtered tool catalogue (MCP + native; built-ins excluded).
   listTools: () => IToolCatalogEntry[]
+  // Tokens this agent has spent - on every run and manual compaction, stopped or failed ones
+  // included - since it was created or resetUsage() was called. Counted call by call as the usage
+  // arrives, so a resumed run adds only what THIS process spent and a subagent's tokens (charged
+  // to its parent run) count once. A snapshot (a copy).
+  readonly usage: IUsage
+  // Zero the counter.
+  resetUsage: () => void
   // Skills (name + description); `learned` marks the ones the agent wrote itself.
   listSkills: () => { name: string; description: string; learned?: true }[]
   // The agent's own lessons (config.learning), with where each came from.
@@ -365,8 +374,11 @@ export const createAgent = async (
       readOnly: c.readOnly === true,
     }))
 
+  // What this agent has spent (see IAgent.usage).
+  const spent: IUsage = normalizeUsage(undefined)
   const ctx: IAgentInternalContext = {
     config,
+    onUsage: (usage) => accumulateUsage(spent, usage),
     executorModel,
     plannerModel,
     synthesizerModel,
@@ -512,6 +524,12 @@ export const createAgent = async (
         description: s.description,
         ...(s.origin ? { learned: true as const } : {}),
       })),
+    get usage() {
+      return { ...spent }
+    },
+    resetUsage: () => {
+      Object.assign(spent, normalizeUsage(undefined))
+    },
     listLearnedSkills: () => (learning ? learning.learned().map((s) => ({ ...s })) : []),
     forgetSkill: async (name: string) => (learning ? learning.forget(name) : false),
     compact: async (options: ICompactOptions): Promise<ICompactResult> => {
@@ -519,10 +537,14 @@ export const createAgent = async (
         thresholdTokens: compaction.thresholdTokens,
         keepRecentTurns: compaction.keepRecentTurns,
         summaryMaxTokens: compactionMaxTokens(config, compaction.summaryMaxTokens),
+        maxInputTokens: Math.floor(compaction.contextWindowTokens * 0.6),
         force: options.force,
         signal: options.signal,
         timeoutMs: config.llmTimeoutMs,
-        onUsage: (usage) => emit({ type: 'usage', phase: 'compact', usage }),
+        onUsage: (usage) => {
+          accumulateUsage(spent, usage)
+          emit({ type: 'usage', phase: 'compact', usage })
+        },
       })
       if (r.compacted) {
         emit({

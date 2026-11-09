@@ -20,7 +20,9 @@ export { checkLimits, resolveLimits } from './limits.ts'
 // Compaction
 export {
   compactHistory,
+  DEFAULT_COMPACTION_THRESHOLD_RATIO,
   estimateTokens,
+  resolveCompaction,
   SUMMARY_PREFIX,
   truncateToolModelOutput,
   withToolOutputLimit,

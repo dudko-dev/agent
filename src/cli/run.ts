@@ -4,13 +4,14 @@ import type {
   AgentEvent,
   IConversationTurn,
   IToolApprovalRequest,
+  IUsage,
   RunControl,
   ThinkingSetting,
   ToolApprovalDecision,
   ToolApprovalMode,
 } from '../index.ts'
 import { createAgent, createRunControl, loadSkillsFromDir } from '../index.ts'
-import { isSummaryTurn } from '../compaction.ts'
+import { isSummaryTurn, resolveCompaction } from '../compaction.ts'
 import { loadConfig, skillsDirFromEnv } from './config.ts'
 import { describeSubagents, parseLiveLine, resolveSubagent, shortId } from './live.ts'
 
@@ -38,6 +39,10 @@ const formatJson = (v: unknown): string => {
     return String(v)
   }
 }
+
+// "1234 tokens (in=1000 out=234 reasoning=50 cached=800)" - what the session has spent.
+const describeSpent = (u: IUsage): string =>
+  `${u.totalTokens} tokens (in=${u.inputTokens} out=${u.outputTokens}${u.reasoningTokens ? ` reasoning=${u.reasoningTokens}` : ''}${u.cachedInputTokens ? ` cached=${u.cachedInputTokens}` : ''}${u.cacheWriteTokens ? ` cache-write=${u.cacheWriteTokens}` : ''}) this session`
 
 const describeThinking = (t: ThinkingSetting | undefined): string => {
   if (t === undefined || t === false) {
@@ -86,7 +91,7 @@ export const runRepl = async (): Promise<void> => {
   )
   console.log(`[mcp]     servers=${mcpNames.length ? mcpNames.join(', ') : '(none)'}`)
   console.log(
-    '[hint]    commands: /status, /tools, /history, /reset, /compact, /autopilot, /approval <mode>, /reconnect, /exit\n',
+    '[hint]    commands: /status, /usage, /tools, /history, /reset, /compact, /autopilot, /approval <mode>, /reconnect, /exit\n',
   )
 
   // Which stream (if any) currently owns the output line.
@@ -497,13 +502,17 @@ export const runRepl = async (): Promise<void> => {
           `[status] thinking=${describeThinking(config.thinking)} approval=${agent.getToolApprovalMode()} limits=${caps.length ? caps.join(' ') : '(none)'}`,
         )
         console.log(
-          `[status] compaction=${config.compaction?.auto === false ? 'manual' : 'auto'} window=${config.compaction?.contextWindowTokens ?? 128_000} skills=${
+          `[status] compaction=${config.compaction?.auto === false ? 'manual' : 'auto'} window=${config.compaction?.contextWindowTokens ?? 128_000} at=${resolveCompaction(config.compaction).thresholdTokens} skills=${
             agent
               .listSkills()
               .map((s) => s.name)
               .join(', ') || '(none)'
           }`,
         )
+        continue
+      }
+      if (prompt === '/usage') {
+        console.log(`[usage]   ${describeSpent(agent.usage)}`)
         continue
       }
       if (prompt === '/history') {
@@ -633,7 +642,7 @@ export const runRepl = async (): Promise<void> => {
         trimHistory(history)
         const u = result.usage
         console.log(
-          `[meta]    iterations=${result.iterations} steps=${result.trace.length} tokens=${u.totalTokens} (in=${u.inputTokens} out=${u.outputTokens}${u.reasoningTokens ? ` reasoning=${u.reasoningTokens}` : ''}${u.cachedInputTokens ? ` cached=${u.cachedInputTokens}` : ''})`,
+          `[meta]    iterations=${result.iterations} steps=${result.trace.length} tokens=${u.totalTokens} (in=${u.inputTokens} out=${u.outputTokens}${u.reasoningTokens ? ` reasoning=${u.reasoningTokens}` : ''}${u.cachedInputTokens ? ` cached=${u.cachedInputTokens}` : ''}) session=${agent.usage.totalTokens}`,
         )
       } catch (err) {
         endLine()

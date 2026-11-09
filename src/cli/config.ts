@@ -291,6 +291,18 @@ const parseCompaction = (): ICompactionConfig | undefined => {
   if (window) {
     cfg.contextWindowTokens = window
   }
+  // AGENT_COMPACTION_THRESHOLD: the share of the window at which auto-compaction starts, as a
+  // percent (85 or 85%). Default 80.
+  const pct = process.env.AGENT_COMPACTION_THRESHOLD?.trim().replace(/%$/, '')
+  if (pct) {
+    const n = Number(pct)
+    if (!Number.isFinite(n) || n < 1 || n > 100) {
+      throw new Error(
+        `AGENT_COMPACTION_THRESHOLD must be a percent of the window, 1 to 100, got: ${process.env.AGENT_COMPACTION_THRESHOLD}`,
+      )
+    }
+    cfg.thresholdRatio = n / 100
+  }
   return Object.keys(cfg).length ? cfg : undefined
 }
 

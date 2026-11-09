@@ -21,6 +21,10 @@
     as skills, `origin.kind: 'learned'`; Memory/Dir stores; secret scan, caps, operator skills
     never overwritten). Knowledge only, never policy: a lesson is loaded under `learnedPreamble`.
     Every guard has a test in `tests/learning*.test.ts` and a mutation check.
+  - `compaction.ts` also owns the estimate (`estimateTokens`: script-aware, errs high) and the fixed-prompt
+    overhead (`promptOverheadTokens`): compaction is judged on prompt + history + trace together against
+    `thresholdRatio` (0.85) of the window, never on one part alone. The estimate is calibrated high on Claude's tokenizer (1.1-1.4x real, never below): keep it that way. `agent.usage` is counted from the
+    `usage` events as they arrive (`ctx.onUsage`), not summed at the end of a run.
   - `safe-fetch.ts` (`createSafeFetch`: own DNS lookup inside the connect, private / metadata
     ranges refused, allow/deny, redirects re-judged, size/time bounded) + `web-fetch.ts` (the
     `web_fetch` tool that `config.egress` switches on). Security boundary: every change needs a

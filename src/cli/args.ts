@@ -50,12 +50,14 @@ Optional env vars (see env.example for the full list):
   AGENT_EGRESS_ALLOW / _DENY  comma lists: host, *.host, IP or CIDR (deny wins; allow limits to these)
   AGENT_EGRESS_PROTOCOLS      https (default) | http | https,http
   AGENT_EGRESS_ALLOW_PRIVATE  on lets it reach private networks (cloud metadata stays refused)
-  AGENT_CONTEXT_WINDOW_TOKENS model window (auto-compaction threshold = 50%)
+  AGENT_CONTEXT_WINDOW_TOKENS model window (default 128000)
+  AGENT_COMPACTION_THRESHOLD  percent of the window at which auto-compaction starts (default 85)
   AGENT_COMPACTION            off disables automatic compaction
 
 Commands inside the REPL:
-  /status, /tools, /history, /reset, /reconnect, /exit
+  /status, /usage, /tools, /history, /reset, /reconnect, /exit
   /compact                    summarise the conversation history now
+  /usage                      tokens this session has spent so far, by kind
   /skills, /forget <name>     list skills (the agent's own marked) / delete one the agent learned
   /agents, /stop [n]          while a run goes: list running subagents / stop one (the run goes on);
                               any other text you type then is said to the running agent

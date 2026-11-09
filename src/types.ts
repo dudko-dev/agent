@@ -100,9 +100,13 @@ export interface ICompactionConfig {
   auto?: boolean
   // Model context window, in tokens. Default 128_000.
   contextWindowTokens?: number
-  // Compact when the estimated context exceeds this. Default: 50% of the
-  // window.
+  // Compact when the estimated context - the fixed prompt (system, tool
+  // definitions, skills), the history and the run's trace together - exceeds
+  // this. Default: thresholdRatio of the window.
   thresholdTokens?: number
+  // The same threshold as a share of the window, 0 < ratio <= 1 (default
+  // 0.85). thresholdTokens wins when both are set.
+  thresholdRatio?: number
   // History turns kept verbatim (default 4).
   keepRecentTurns?: number
   // Trace steps kept verbatim (default 3).
