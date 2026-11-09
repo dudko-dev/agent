@@ -32,6 +32,9 @@ export interface IRunState {
 
 export interface IAgentInternalContext {
   config: IAgentConfig
+  // Called with the usage of every model call a run makes, as it arrives (the agent's own total,
+  // IAgent.usage). Not called for a resumed run's earlier usage: that was spent before.
+  onUsage?: (usage: IUsage) => void
   executorModel: LanguageModel
   plannerModel: LanguageModel
   synthesizerModel: LanguageModel

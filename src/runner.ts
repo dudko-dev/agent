@@ -3,7 +3,15 @@ import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { compactionMaxTokens } from './call-options.ts'
-import { compactHistory, estimateTokens, resolveCompaction, summarizeTrace } from './compaction.ts'
+import {
+  compactHistory,
+  estimateTokens,
+  promptOverheadTokens,
+  renderTurns,
+  resolveCompaction,
+  summarizeTrace,
+  toolDefinitionTokens,
+} from './compaction.ts'
 import { portOf, type RunControlPort } from './control.ts'
 import { runContext } from './context.ts'
 import { executeStep } from './executor.ts'
@@ -303,6 +311,7 @@ const runAgentLoopInner = async (
     emit: (event: AgentEvent) => {
       if (event.type === 'usage') {
         accumulateUsage(totalUsage, event.usage)
+        ctx.onUsage?.(event.usage)
       }
       const tagged = { ...event, runId: runContext.getStore()?.runId }
       try {
@@ -363,6 +372,25 @@ const runAgentLoopInner = async (
     }
   }
 
+  // How much of the window the fixed part of every prompt takes (system, tool definitions,
+  // skills): compaction judges the WHOLE context, not the history or the trace alone. Read live -
+  // a lesson the agent writes mid-run grows the skills index.
+  const promptOverhead = async (): Promise<number> => {
+    const skills = ctx.skills ?? []
+    return promptOverheadTokens({
+      systemPrompt: ctx.config.systemPrompt,
+      toolTokens: await toolDefinitionTokens(ctx.tools),
+      searching: state.strategy === 'search',
+      skillsText: [
+        ...skills.map((s) => `- ${s.name}: ${s.description}`),
+        ...skills.filter((s) => state.activeSkills.includes(s.name)).map((s) => s.content),
+      ].join('\n'),
+    })
+  }
+  // What the summariser is shown at most: a share of the window, so a long history is summarised
+  // whole rather than overflowing the summariser's own window.
+  const summaryInputTokens = Math.floor(compaction.contextWindowTokens * 0.6)
+
   // Automatic history compaction (fresh runs only - a resumed run already
   // carries the history its trace was built from). The run works on the
   // compacted copy; the caller's array is never mutated and gets the copy
@@ -371,6 +399,8 @@ const runAgentLoopInner = async (
   if (!resumed && history?.length && compaction.auto) {
     const r = await compactHistory(history, ctx.synthesizerModel, {
       thresholdTokens: compaction.thresholdTokens,
+      overheadTokens: await promptOverhead(),
+      maxInputTokens: summaryInputTokens,
       keepRecentTurns: compaction.keepRecentTurns,
       summaryMaxTokens: compactionMaxTokens(ctx.config, compaction.summaryMaxTokens),
       signal,
@@ -399,7 +429,9 @@ const runAgentLoopInner = async (
     }
     const view = () => ({ summary: state.traceSummary, upTo: state.traceSummaryUpTo })
     const beforeTokens = estimateTokens(renderTrace(trace, view()))
-    if (beforeTokens <= compaction.thresholdTokens) {
+    // The window holds the fixed prompt and the history as well as the trace.
+    const historyTokens = history?.length ? estimateTokens(renderTurns(history)) : 0
+    if (beforeTokens + historyTokens + (await promptOverhead()) <= compaction.thresholdTokens) {
       return
     }
     const upTo = trace.length - compaction.keepRecentSteps
@@ -413,6 +445,7 @@ const runAgentLoopInner = async (
       ctx.synthesizerModel,
       {
         summaryMaxTokens: compactionMaxTokens(ctx.config, compaction.summaryMaxTokens),
+        maxInputTokens: summaryInputTokens,
         signal,
         timeoutMs: ctx.config.llmTimeoutMs,
         render: renderTraceSteps,

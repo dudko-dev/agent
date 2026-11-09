@@ -51,17 +51,25 @@ const turns = (n: number, size = 40): IConversationTurn[] =>
     content: `turn ${i} ${'x'.repeat(size)}`,
   }))
 
-test('estimateTokens is ceil(chars / 4)', () => {
+test('estimateTokens: by kind of character, calibrated high (see compaction-window.test.ts)', () => {
   assert.equal(estimateTokens(''), 0)
-  assert.equal(estimateTokens('abcd'), 1)
-  assert.equal(estimateTokens('abcde'), 2)
+  // 1.1 x (letters / 2.5), digits 1, punctuation 1.1, a space a quarter, a newline 1, other
+  // scripts 1/2, CJK and emoji 1.
+  assert.equal(estimateTokens('a'.repeat(250)), 110)
+  assert.equal(estimateTokens('7'.repeat(100)), 110)
+  assert.equal(estimateTokens('{'.repeat(100)), 121)
+  assert.equal(estimateTokens(' '.repeat(40)), 11)
+  assert.equal(estimateTokens('\n'.repeat(10)), 11)
+  assert.equal(estimateTokens('ж'.repeat(100)), 55)
+  assert.equal(estimateTokens('漢'.repeat(100)), 110)
 })
 
-test('resolveCompaction defaults: auto on, 128k window, threshold at 50%', () => {
+test('resolveCompaction defaults: auto on, 128k window, threshold at 85%', () => {
   assert.deepEqual(resolveCompaction(undefined), {
     auto: true,
     contextWindowTokens: 128_000,
-    thresholdTokens: 64_000,
+    thresholdTokens: 108_800,
+    thresholdRatio: 0.85,
     keepRecentTurns: 4,
     keepRecentSteps: 3,
     summaryMaxTokens: 1024,
@@ -76,7 +84,7 @@ test('resolveCompaction defaults: auto on, 128k window, threshold at 50%', () =>
     clearToolResultsAfterTokens: 0,
   })
   assert.equal(custom.auto, false)
-  assert.equal(custom.thresholdTokens, 4_000)
+  assert.equal(custom.thresholdTokens, 6_800)
   assert.equal(custom.maxToolOutputChars, 0)
   assert.equal(custom.clearToolResultsAfterTokens, 0)
 })

@@ -274,7 +274,8 @@ Long conversations and long runs are compacted automatically; everything is on b
 compaction: {
   auto: true, // default
   contextWindowTokens: 128_000, // default
-  thresholdTokens: 64_000, // default: 50% of the window
+  thresholdRatio: 0.85, // default: start at 85% of the window (0 < ratio <= 1)
+  // thresholdTokens: 100_000, // ...or an absolute number; it wins over the ratio
   keepRecentTurns: 4, // history turns kept verbatim
   keepRecentSteps: 3, // trace steps kept verbatim
   summaryMaxTokens: 1024,
@@ -284,14 +285,22 @@ compaction: {
 }
 ```
 
-- **History, at run start.** When the estimated history (`estimateTokens` = chars / 4) exceeds the threshold, all but the last `keepRecentTurns` turns become ONE assistant turn starting with `[Summary of earlier conversation]`. The run works on the compacted copy; your array is never mutated, and the result carries it as `result.compactedHistory` so you can store it instead.
-- **Trace, before each executor / replanner / synthesizer call.** Over the threshold, every step but the last `keepRecentSteps` is folded into a running summary; prompts show `Summary of earlier steps: …` followed by the recent steps verbatim. The trace itself stays intact in the result, the events and persistence; the summary is saved in the snapshot (`traceSummary`, `traceSummaryUpTo`) so a resumed run keeps it.
+- **History, at run start.** When the history no longer fits (see below), all but the last `keepRecentTurns` turns become ONE assistant turn starting with `[Summary of earlier conversation]`. The run works on the compacted copy; your array is never mutated, and the result carries it as `result.compactedHistory` so you can store it instead.
+- **Trace, before each executor / replanner / synthesizer call.** When it no longer fits, every step but the last `keepRecentSteps` is folded into a running summary; prompts show `Summary of earlier steps: …` followed by the recent steps verbatim. The trace itself stays intact in the result, the events and persistence; the summary is saved in the snapshot (`traceSummary`, `traceSummaryUpTo`) so a resumed run keeps it.
 - **Tool results.** Every tool (MCP, native, built-in) gets a `toModelOutput` that clips what the model sees to `maxToolOutputChars` with a `… [truncated N chars]` marker. A tool's own `toModelOutput` runs first. The raw output still lands in the trace and in `step.tool-result`.
 - **Stale tool results inside a step** (context editing, like Anthropic's `clear_tool_uses` and Claude Code's micro-compaction). Once a step's tool loop grows past `clearToolResultsAfterTokens`, the oldest results are replaced with a one-line stub (`[<tool> result cleared to save context — call the tool again if you still need it]`), keeping the newest `keepToolResults`. The calls stay, so the model knows what it did. Clearing is sticky (the cached prefix doesn't flip back) and keyed by position, so servers that repeat tool-call ids are fine. `createToolResultClearer` is exported.
+
+**What "fits" means.** The threshold is a share of the window (85% by default) judged on the **whole context** of the next call: the fixed prompt (stage instructions, tool definitions, the skills index and active skills, your `systemPrompt`) **plus** the history **plus** the run's trace. Judging each part alone would let a long history and a long trace each stay under the line while together overflowing the window; the rest is room for the answer and for what one step adds before the next check. The fixed prompt is estimated (about 1 500 tokens + your `systemPrompt` + the tool definitions + the skills; under tool search only a few definitions are sent, so the tools count at most 3 000).
+
+**The estimate** (`estimateTokens`) counts by kind of character, because text is not one thing: letters ~2.5 to a token, digits and punctuation about one each, a space a quarter, a newline one, other scripts (Russian) two characters, CJK and emoji one. It was calibrated against Claude's tokenizer over prose, markdown, code, JSON, a table, Russian and a mix, and comes out **1.1-1.4x the real count and never below it** (a flat "4 characters a token" was 0.4-0.7x for everything but Russian: JSON and code run 1.6-2.4 characters a token, and tool definitions 2x what 4 would give). It leans high on purpose: compacting a little early is cheap, overflowing the window is a failed run. So at the default 85% a Claude model has roughly 70-75% of its window really used when compaction starts; a tokenizer that packs tighter (OpenAI, Gemini) starts a little earlier still - raise `thresholdRatio` (0.9, 0.95) to compact later. **What the summariser is shown** is the newest part of what is being folded that fits 60% of the window. CLI: `AGENT_COMPACTION_THRESHOLD=90` (percent) moves the line; `AGENT_CONTEXT_WINDOW_TOKENS` sets the window the share is taken of.
 
 Each compaction emits `context.compacted` (`scope: 'history' | 'trace' | 'tool-results'`, `beforeTokens`, `afterTokens`); the summary call's usage is reported as `usage` with `phase: 'compact'` and counts toward the run. The synthesizer model writes the summaries.
 
 Manual: `agent.compact({ history, force?, signal? })` returns `{ history, summary?, beforeTokens, afterTokens, compacted }`; the CLI's `/compact` does exactly that for the REPL history. `compactHistory(turns, model, opts)` is exported for use without an agent. Compaction never throws — on any failure the input comes back unchanged.
+
+## Usage: what a session has spent
+
+`result.usage` is one run's tokens (`inputTokens`, `outputTokens`, `totalTokens`, and `reasoningTokens` / `cachedInputTokens` / `cacheWriteTokens` when the provider reports them). `agent.usage` is the agent's total over all its runs and manual compactions since it was created (or `agent.resetUsage()`): a snapshot, counted call by call as the usage arrives, so a run that is stopped or fails still counts what it spent, a resumed run adds only what THIS process spent, and a subagent's tokens (charged to its parent run) count once. The REPL shows it: `/usage`, and `session=<total>` on every answer's `[meta]` line.
 
 ## Skills
 
@@ -634,6 +643,8 @@ interface IAgent {
   listTools(): { name: string; description: string; server?: string; readOnly?: boolean }[]
   listSkills(): { name: string; description: string; learned?: true }[]
   listLearnedSkills(): ISkill[] // the agent's own lessons, with origin (see Learning)
+  readonly usage: IUsage // tokens this agent has spent over all its runs (a snapshot; see below)
+  resetUsage(): void
   forgetSkill(name: string): Promise<boolean> // delete one of them; false if there is none
   compact(options: { history: IConversationTurn[]; signal?: AbortSignal; force?: boolean }): Promise<{
     history: IConversationTurn[]
@@ -684,9 +695,9 @@ The package ships a REPL CLI as `dd-agent`. After install, npm makes it availabl
 dd-agent --env-file=.env
 ```
 
-`--env-file=<path>` is loaded via Node's built-in `process.loadEnvFile`, so no `dotenv` dependency is needed. Without the flag the CLI reads the ambient process env. `-h` / `--help` prints the supported flags and the in-REPL slash commands (`/status`, `/tools`, `/history`, `/reset`, `/compact`, `/autopilot`, `/approval <mode>`, `/reconnect`, `/agents`, `/stop`, `/exit`).
+`--env-file=<path>` is loaded via Node's built-in `process.loadEnvFile`, so no `dotenv` dependency is needed. Without the flag the CLI reads the ambient process env. `-h` / `--help` prints the supported flags and the in-REPL slash commands (`/status`, `/usage`, `/tools`, `/history`, `/reset`, `/compact`, `/autopilot`, `/approval <mode>`, `/reconnect`, `/agents`, `/stop`, `/exit`).
 
-The newer features are env-driven too: `AGENT_THINKING` (`off | minimal | low | medium | high | xhigh | <budget tokens>`), `AGENT_MAX_INPUT_TOKENS` / `AGENT_MAX_OUTPUT_TOKENS` / `AGENT_MAX_REASONING_TOKENS` / `AGENT_MAX_TOTAL_TOKENS`, `AGENT_MAX_TOOL_CALLS`, `AGENT_TOOL_APPROVAL` (`autopilot | ask-writes | ask-all | read-only`), `AGENT_TOOL_RULES` (JSON `{ "<tool or glob*>": "allow" | "ask" | "deny" }`, beats the mode — e.g. `{"github__delete_*":"deny"}`), `AGENT_EGRESS` (`on | off`; with `AGENT_EGRESS_ALLOW`, `AGENT_EGRESS_DENY`, `AGENT_EGRESS_PROTOCOLS`, `AGENT_EGRESS_ALLOW_PRIVATE` — see [Egress](#egress-what-the-model-may-fetch)), `AGENT_SKILLS_DIR`, `AGENT_LEARNING` (`on | off`; `AGENT_LEARNING_DIR` keeps the lessons across sessions — see [Learning](#learning-lessons-that-outlive-the-task)), `AGENT_TOOL_SELECTION_STRATEGY` (`auto | all | plan-narrowed | search`), `AGENT_CONTEXT_WINDOW_TOKENS` and `AGENT_COMPACTION=off`. The REPL prints the model's thoughts dimmed, auto-compacts its history with the same settings, and — when the approval mode asks — prompts `allow? [y]es / [n]o / [a]lways` right in the terminal; `/autopilot` toggles between autopilot and the last asking mode.
+The newer features are env-driven too: `AGENT_THINKING` (`off | minimal | low | medium | high | xhigh | <budget tokens>`), `AGENT_MAX_INPUT_TOKENS` / `AGENT_MAX_OUTPUT_TOKENS` / `AGENT_MAX_REASONING_TOKENS` / `AGENT_MAX_TOTAL_TOKENS`, `AGENT_MAX_TOOL_CALLS`, `AGENT_TOOL_APPROVAL` (`autopilot | ask-writes | ask-all | read-only`), `AGENT_TOOL_RULES` (JSON `{ "<tool or glob*>": "allow" | "ask" | "deny" }`, beats the mode — e.g. `{"github__delete_*":"deny"}`), `AGENT_EGRESS` (`on | off`; with `AGENT_EGRESS_ALLOW`, `AGENT_EGRESS_DENY`, `AGENT_EGRESS_PROTOCOLS`, `AGENT_EGRESS_ALLOW_PRIVATE` — see [Egress](#egress-what-the-model-may-fetch)), `AGENT_SKILLS_DIR`, `AGENT_LEARNING` (`on | off`; `AGENT_LEARNING_DIR` keeps the lessons across sessions — see [Learning](#learning-lessons-that-outlive-the-task)), `AGENT_TOOL_SELECTION_STRATEGY` (`auto | all | plan-narrowed | search`), `AGENT_CONTEXT_WINDOW_TOKENS`, `AGENT_COMPACTION_THRESHOLD` (percent of the window where auto-compaction starts, default 85) and `AGENT_COMPACTION=off`. The REPL prints the model's thoughts dimmed, auto-compacts its history with the same settings, and — when the approval mode asks — prompts `allow? [y]es / [n]o / [a]lways` right in the terminal; `/autopilot` toggles between autopilot and the last asking mode.
 
 **Talking to the agent while it works.** The REPL keeps reading while a run goes. Text you type then is said to the running agent (it sees it at its next boundary and the replanner re-checks the plan — see [Steering a run](#steering-a-run-that-is-already-going)): the REPL prints `[you->agent] queued` and then `delivered (round|step|final)`, and the message enters the history as a user turn. A message that arrives while the answer is being written is sent as the next prompt (`[follow-up]`). After Ctrl-C nothing is sent behind your back: what the agent never saw is listed as `[not delivered]`. While a run goes, `/agents` lists the running subagents and `/stop <n>` (or an id prefix, or just `/stop` when one runs) stops one — the run goes on; the other REPL commands work between runs. Each subagent's own steps and tool calls are logged as `[name id] ...` lines, so parallel ones can be told apart.
 

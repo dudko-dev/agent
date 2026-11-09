@@ -1,14 +1,20 @@
-import { generateText, type LanguageModel, type Tool, type ToolSet } from 'ai'
+import { asSchema, generateText, type LanguageModel, type Tool, type ToolSet } from 'ai'
 import type { ICompactionConfig, IConversationTurn, IStepResult, IUsage } from './types.ts'
 import { clipText, normalizeUsage, withTimeout } from './utils.ts'
 
 export const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
 export const DEFAULT_MAX_TOOL_OUTPUT_CHARS = 20_000
 
+// Compaction starts at this share of the window unless configured. The estimate leans high (see
+// estimateTokens), so on a Claude model this is roughly 70-75% really used - the rest is room for
+// the answer and for what one step adds before the next check.
+export const DEFAULT_COMPACTION_THRESHOLD_RATIO = 0.85
+
 export interface IResolvedCompaction {
   auto: boolean
   contextWindowTokens: number
   thresholdTokens: number
+  thresholdRatio: number
   keepRecentTurns: number
   keepRecentSteps: number
   summaryMaxTokens: number
@@ -20,12 +26,18 @@ export interface IResolvedCompaction {
 const nonNeg = (v: number | undefined, fallback: number): number =>
   typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : fallback
 
+const ratioOf = (r: number | undefined): number =>
+  typeof r === 'number' && r > 0 && r <= 1 ? r : DEFAULT_COMPACTION_THRESHOLD_RATIO
+
 export const resolveCompaction = (cfg: ICompactionConfig | undefined): IResolvedCompaction => {
   const contextWindowTokens = nonNeg(cfg?.contextWindowTokens, 0) || DEFAULT_CONTEXT_WINDOW_TOKENS
+  const thresholdRatio = ratioOf(cfg?.thresholdRatio)
   return {
     auto: cfg?.auto !== false,
     contextWindowTokens,
-    thresholdTokens: nonNeg(cfg?.thresholdTokens, 0) || Math.floor(contextWindowTokens / 2),
+    thresholdTokens:
+      nonNeg(cfg?.thresholdTokens, 0) || Math.floor(contextWindowTokens * thresholdRatio),
+    thresholdRatio,
     keepRecentTurns: nonNeg(cfg?.keepRecentTurns, 4),
     keepRecentSteps: nonNeg(cfg?.keepRecentSteps, 3),
     summaryMaxTokens: nonNeg(cfg?.summaryMaxTokens, 0) || 1024,
@@ -38,8 +50,123 @@ export const resolveCompaction = (cfg: ICompactionConfig | undefined): IResolved
   }
 }
 
-// Cheap, provider-agnostic token estimate: ~4 chars per token.
-export const estimateTokens = (text: string): number => Math.ceil(text.length / 4)
+// Chinese / Japanese / Korean characters and the halves of a surrogate pair (emoji): about a
+// token each. Other non-ASCII text (Cyrillic, Greek, accented Latin...) about two characters.
+const isWide = (c: number): boolean =>
+  (c >= 0x3040 && c <= 0x9fff) || (c >= 0xac00 && c <= 0xd7af) || (c >= 0xd800 && c <= 0xdfff)
+
+// Cheap, provider-agnostic token estimate, by kind of character - because text is not one thing:
+// letters run ~2.5 to a token (prose is kinder, code, markdown and JSON are not), digits and
+// punctuation about one each (JSON, tables, ids), a space a quarter, a newline one, other scripts
+// (Russian...) two characters, CJK and emoji one. Calibrated against Claude's tokenizer, the most
+// token-hungry in use, over prose, markdown, code, JSON, a table, Russian and a mix: it comes out
+// 1.1-1.4x the real count and never below it (a flat "4 characters a token" was 0.4-0.7x for
+// everything but Russian). It errs high ON PURPOSE: it decides when to compact, and compacting a
+// little early is cheap while overflowing the window is a failed run. A tokenizer that packs
+// tighter (OpenAI, Gemini) makes it higher still - then raise thresholdRatio.
+export const estimateTokens = (text: string): number => {
+  let letters = 0
+  let digits = 0
+  let spaces = 0
+  let newlines = 0
+  let punct = 0
+  let other = 0
+  let wide = 0
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text.charCodeAt(i)
+    if (c < 128) {
+      if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90)) {
+        letters += 1
+      } else if (c >= 48 && c <= 57) {
+        digits += 1
+      } else if (c === 32 || c === 9) {
+        spaces += 1
+      } else if (c === 10) {
+        newlines += 1
+      } else {
+        punct += 1
+      }
+    } else if (isWide(c)) {
+      wide += 1
+    } else {
+      other += 1
+    }
+  }
+  // In thousandths of a token, so the arithmetic is exact: 1.1 x (letters / 2.5 + digits +
+  // punctuation x 1.1 + spaces / 4 + newlines + other / 2 + wide).
+  return Math.ceil(
+    (440 * letters +
+      1100 * digits +
+      1210 * punct +
+      275 * spaces +
+      1100 * newlines +
+      550 * other +
+      1100 * wide) /
+      1000,
+  )
+}
+
+// The NEWEST part of `text` that fits `maxTokens` (estimated). Cut at a line break when there is
+// one near the cut, so a summariser never starts mid-sentence if it can help it.
+export const tailWithinTokens = (text: string, maxTokens: number): string => {
+  if (!(maxTokens > 0) || estimateTokens(text) <= maxTokens) {
+    return text
+  }
+  let cut = text.slice(-Math.max(1, Math.floor(maxTokens * 4)))
+  while (cut.length > 1 && estimateTokens(cut) > maxTokens) {
+    cut = cut.slice(Math.ceil(cut.length * 0.1))
+  }
+  const nl = cut.indexOf('\n')
+  return nl >= 0 && nl < cut.length / 4 ? cut.slice(nl + 1) : cut
+}
+
+// What every call carries whatever the transcript: stage instructions, the goal, the plan, the state.
+export const BASE_PROMPT_TOKENS = 1500
+// Under tool search the model is sent only the built-ins and the tools found so far.
+export const SEARCH_TOOLS_ALLOWANCE = 3000
+
+const toolTokenCache = new WeakMap<object, number>()
+
+// Estimated tokens of the tool definitions a model is sent (name, description, JSON schema of the
+// input). Cached per tool object: a tool set is rebuilt rarely and its schemas never change.
+export const toolDefinitionTokens = async (tools: ToolSet): Promise<number> => {
+  const sizes = await Promise.all(
+    Object.entries(tools).map(async ([name, t]) => {
+      const cached = toolTokenCache.get(t)
+      if (cached !== undefined) {
+        return cached
+      }
+      let parameters: unknown
+      try {
+        parameters = await asSchema(t.inputSchema as never).jsonSchema
+      } catch {
+        parameters = undefined
+      }
+      const size = estimateTokens(
+        JSON.stringify({ name, description: t.description ?? '', parameters }),
+      )
+      toolTokenCache.set(t, size)
+      return size
+    }),
+  )
+  return sizes.reduce((a, b) => a + b, 0)
+}
+
+// The tokens of a call's prompt that do not come from the transcript or the step log - the stage
+// instructions, the tool definitions, the skills - so that compaction can judge how full the
+// window really is (history and trace alone say nothing about a 15k-token tool catalogue).
+export const promptOverheadTokens = (p: {
+  systemPrompt?: string
+  toolTokens: number
+  // Tool search: only a few definitions are sent at a time.
+  searching: boolean
+  // The rendered skills index and the active skills' instructions.
+  skillsText: string
+}): number =>
+  BASE_PROMPT_TOKENS +
+  estimateTokens(p.systemPrompt ?? '') +
+  (p.searching ? Math.min(p.toolTokens, SEARCH_TOOLS_ALLOWANCE) : p.toolTokens) +
+  estimateTokens(p.skillsText)
 
 export const SUMMARY_PREFIX = '[Summary of earlier conversation]'
 
@@ -58,12 +185,19 @@ const TRACE_SUMMARY_SYSTEM = `You compress the execution trace of an AI agent.
 Summarize the executed steps below into a compact, factual record the agent can rely on for the remaining steps. Keep every concrete result: identifiers, names, numbers, URLs, file paths, errors and what failed, and conclusions. Drop narration. Write plain text, no preamble.`
 
 export interface ICompactHistoryOptions {
-  // Compact only when the estimate exceeds this (default 64_000).
+  // Compact only when the estimate - plus overheadTokens - exceeds this (default 80% of the
+  // default 128_000 window).
   thresholdTokens?: number
+  // What the call carries besides this history (system prompt, tool definitions, skills): it
+  // shares the window, so it counts against the threshold.
+  overheadTokens?: number
   // Turns kept verbatim (default 4).
   keepRecentTurns?: number
   // Output cap of the summary call (default 1024).
   summaryMaxTokens?: number
+  // The most the summariser is shown, in estimated tokens (the newest part is kept). Default:
+  // everything older than the kept turns.
+  maxInputTokens?: number
   // Compact regardless of the threshold.
   force?: boolean
   signal?: AbortSignal
@@ -100,8 +234,10 @@ export const compactHistory = async (
     afterTokens: beforeTokens,
     compacted: false,
   }
-  const threshold = opts.thresholdTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS / 2
-  if (!opts.force && beforeTokens <= threshold) {
+  const threshold =
+    opts.thresholdTokens ??
+    Math.floor(DEFAULT_CONTEXT_WINDOW_TOKENS * DEFAULT_COMPACTION_THRESHOLD_RATIO)
+  if (!opts.force && beforeTokens + (opts.overheadTokens ?? 0) <= threshold) {
     return unchanged
   }
   const keep = Math.max(0, opts.keepRecentTurns ?? 4)
@@ -117,7 +253,11 @@ export const compactHistory = async (
     const r = await generateText({
       model,
       instructions: HISTORY_SUMMARY_SYSTEM,
-      prompt: `Conversation to summarize:\n${renderTurns(older)}`,
+      prompt: `Conversation to summarize:\n${
+        opts.maxInputTokens
+          ? tailWithinTokens(renderTurns(older), opts.maxInputTokens)
+          : renderTurns(older)
+      }`,
       maxOutputTokens: opts.summaryMaxTokens ?? 1024,
       abortSignal: withTimeout(opts.signal, opts.timeoutMs ?? 0),
       maxRetries: 0,
@@ -149,6 +289,8 @@ export interface ISummarizeTraceOptions {
   summaryMaxTokens?: number
   signal?: AbortSignal
   timeoutMs?: number
+  // The most the summariser is shown, in estimated tokens (the newest part is kept).
+  maxInputTokens?: number
   // Renders the steps (the prompt module's renderer, injected to avoid a
   // circular import).
   render: (steps: IStepResult[], offset: number) => string
@@ -172,7 +314,11 @@ export const summarizeTrace = async (
       instructions: TRACE_SUMMARY_SYSTEM,
       prompt: [
         previousSummary ? `Summary of the steps before these:\n${previousSummary}\n` : '',
-        `Steps to summarize:\n${opts.render(steps, opts.offset)}`,
+        `Steps to summarize:\n${
+          opts.maxInputTokens
+            ? tailWithinTokens(opts.render(steps, opts.offset), opts.maxInputTokens)
+            : opts.render(steps, opts.offset)
+        }`,
       ]
         .filter(Boolean)
         .join('\n'),

@@ -41,6 +41,7 @@ const CONFIG_KEYS = [
   'AGENT_SKILLS_DIR',
   'AGENT_CONTEXT_WINDOW_TOKENS',
   'AGENT_COMPACTION',
+  'AGENT_COMPACTION_THRESHOLD',
   'AGENT_EGRESS',
   'AGENT_EGRESS_ALLOW',
   'AGENT_EGRESS_DENY',
@@ -440,4 +441,24 @@ test('AGENT_LEARNING: a folder without the switch, or a typo, is an error - neve
   delete process.env.AGENT_LEARNING_DIR
   process.env.AGENT_LEARNING = 'sometimes'
   assert.throws(() => loadConfig(), /AGENT_LEARNING must be on \| off/)
+})
+
+// ── AGENT_COMPACTION_THRESHOLD: where auto-compaction starts ──────────────────
+
+test('AGENT_COMPACTION_THRESHOLD: a percent of the window, 85 or 85%; unset leaves the default', () => {
+  setMinimalOpenAi()
+  assert.equal(loadConfig().compaction, undefined)
+  process.env.AGENT_COMPACTION_THRESHOLD = '85'
+  assert.deepEqual(loadConfig().compaction, { thresholdRatio: 0.85 })
+  process.env.AGENT_COMPACTION_THRESHOLD = ' 90% '
+  process.env.AGENT_CONTEXT_WINDOW_TOKENS = '32000'
+  assert.deepEqual(loadConfig().compaction, { contextWindowTokens: 32000, thresholdRatio: 0.9 })
+})
+
+test('AGENT_COMPACTION_THRESHOLD: nonsense is an error, not a silent default', () => {
+  setMinimalOpenAi()
+  for (const bad of ['0', '101', '-5', 'half', '0.85x']) {
+    process.env.AGENT_COMPACTION_THRESHOLD = bad
+    assert.throws(() => loadConfig(), /AGENT_COMPACTION_THRESHOLD must be a percent/, bad)
+  }
 })
