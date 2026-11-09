@@ -55,7 +55,7 @@ Optional env vars (see env.example for the full list):
   AGENT_COMPACTION            off disables automatic compaction
 
 Commands inside the REPL:
-  /status, /usage, /tools, /history, /reset, /reconnect, /exit
+  /status, /usage, /tools, /history, /reset, /reconnect, /exit (or /quit)
   /compact                    summarise the conversation history now
   /usage                      tokens this session has spent so far, by kind
   /skills, /forget <name>     list skills (the agent's own marked) / delete one the agent learned

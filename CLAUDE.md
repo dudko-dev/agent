@@ -32,6 +32,17 @@
   - `control.ts` (`createRunControl`: send a message into a running loop, stop one
     subagent). The runner drains it at round / step / final boundaries; messages are
     recorded in `IRunState.userUpdates` and in run snapshots.
+  - `provider.ts` (`resolveStage` / model factory per provider), `mcp.ts` (stdio + streamable-HTTP
+    MCP connections, reconnect, paginated `tools/list`) + `mcp-oauth.ts` (OAuth 2.1 / DCR provider,
+    file-backed tokens), `tracing.ts` (OpenTelemetry spans, a no-op without an SDK), `utils.ts`
+    (retry / timeout / usage helpers).
+  - `internal.ts` (`IRunState`: the per-run mutable state shared by the runner, the stages and the tool
+    wrappers) + `context.ts` (`runContext`, the AsyncLocalStorage that carries run id, emit and state
+    into tools). Neither is public API.
+  - `cli/` — the `dd-agent` REPL (`start.ts` entry, `args.ts` flags + `--help`, `config.ts` env →
+    `IAgentConfig`, `run.ts` the REPL and its slash commands, `live.ts` what a line typed *while* a
+    run goes means). A new env var / flag / command goes in `args.ts` (help), `config.ts` /
+    `run.ts`, `env.example` **and** the README's CLI section.
   - `index.ts` is exports only.
 - `tests/` — `node:test` suites, run via `node --experimental-strip-types`
 - `dist/` — `tsup` build output (do not edit)

@@ -92,19 +92,53 @@ await agent.close()
 
 ### Streaming events
 
-Pass an event handler as the second argument to `createAgent`, or per run via `onEvent`. Events include plan deltas, step starts and tool calls, replanner decisions, retries, budget breaches, the streamed final answer, and errors. See [`AgentEvent`](./src/types.ts) for the full union; the newer ones:
+Pass an event handler as the second argument to `createAgent`, or per run via `onEvent`. Every event carries the `runId` of its run, so a handler shared by concurrent runs can tell them apart. The full union is [`AgentEvent`](./src/types.ts); this is the whole list, by stage.
+
+**The loop**
 
 | Event | When |
 | --- | --- |
+| `plan.thought-delta` | The planner's thought, streamed. |
+| `plan.step-added` | A step of the plan is coherent enough to show (`step`, `index`). A hint for incremental UIs — it can still change before `plan.created`. |
+| `plan.created` | The canonical plan (`plan`). |
+| `plan.revised` | The replanner replaced the remaining steps (`plan`, `reason`). |
+| `step.start` | A step began (`step`, `index`). |
+| `step.text-delta` | The executor's text for the step. |
 | `step.reasoning-delta` / `final.reasoning-delta` | The executor's / synthesizer's thoughts, when [thinking](#thinking-reasoning) is on and the provider streams them. |
+| `step.tool-call` / `step.tool-result` | A tool was called (`name`, `input`) / returned (`output`, `ok`). |
+| `step.complete` | The step finished (`result`). |
+| `replan.decision` | The replanner's verdict: `mode: 'continue' \| 'revise' \| 'finish'`, `reason`, and `cause: 'last-step' \| 'clean-step' \| 'llm-decision' \| 'user-message'`. |
+| `revisions.exceeded` | The cap on plan revisions (`cap`) was reached; the run goes on to synthesize. |
+| `final.text-delta` | The final answer, streamed. |
+| `final` | The final answer, whole (`text`). |
+| `retry` | A stage failed and is being retried (`phase`, `attempt`, `error`). |
+| `error` | A stage failed for good (`error`, `phase: 'plan' \| 'execute' \| 'replan' \| 'synthesize' \| 'init'`). |
+| `log` | A log line (`level`, `message`), the same ones `config.logger` gets. |
+
+**Budgets, context and cost**
+
+| Event | When |
+| --- | --- |
+| `usage` | Per LLM call; `phase` is `'plan' \| 'execute' \| 'replan' \| 'synthesize' \| 'compact' \| 'subagent'`. Counted live into [`agent.usage`](#usage-what-a-session-has-spent). |
 | `budget.exceeded` | A run cap was crossed; `kind: 'input' \| 'output' \| 'reasoning' \| 'total' \| 'tool-calls'`, `tokens`, `cap`. |
-| `context.compacted` | History or trace was compacted (`scope`, `beforeTokens`, `afterTokens`). |
+| `context.compacted` | History, trace or stale tool results were compacted (`scope: 'history' \| 'trace' \| 'tool-results'`, `beforeTokens`, `afterTokens`). |
+
+**Tools, skills and consent**
+
+| Event | When |
+| --- | --- |
 | `skill.activated` | A skill became active (`by: 'plan' \| 'tool'`). |
 | `tools.discovered` | `find_tools` activated tools (`query`, `names`). |
 | `tool.approval-requested` / `tool.approval-resolved` | The approval gate asked / decided (`automatic` for rule, mode and timeout denials). |
-| `subagent.start` / `subagent.event` / `subagent.complete` / `subagent.error` | A subagent tool call's lifecycle and its forwarded child events. |
+| `egress.request` | A `web_fetch` request, allowed or refused by the [egress policy](#egress-what-the-model-may-fetch) (`url` is origin and path only, `allowed`, `status?`, `reason?`). |
+| `skill.learned` / `skill.forgotten` | The agent wrote, rewrote (`update`) or removed a lesson — see [Learning](#learning-lessons-that-outlive-the-task) (`name`, and for a lesson `description`, `chars`, `sources`). |
+
+**Subagents and steering**
+
+| Event | When |
+| --- | --- |
+| `subagent.start` / `subagent.event` / `subagent.complete` / `subagent.error` | A subagent tool call's lifecycle and its forwarded child events (`error` carries `stopped` when the user stopped it). |
 | `message.queued` / `message.delivered` | A `RunControl.send()` message is waiting for a boundary / the model has seen it (`at: 'round' \| 'step' \| 'final'`). See [Steering a run](#steering-a-run-that-is-already-going). |
-| `usage` | Per LLM call; `phase` is `'plan' \| 'execute' \| 'replan' \| 'synthesize' \| 'compact' \| 'subagent'`. |
 
 ```ts
 const agent = await createAgent(config, (event) => {
@@ -695,7 +729,7 @@ The package ships a REPL CLI as `dd-agent`. After install, npm makes it availabl
 dd-agent --env-file=.env
 ```
 
-`--env-file=<path>` is loaded via Node's built-in `process.loadEnvFile`, so no `dotenv` dependency is needed. Without the flag the CLI reads the ambient process env. `-h` / `--help` prints the supported flags and the in-REPL slash commands (`/status`, `/usage`, `/tools`, `/history`, `/reset`, `/compact`, `/autopilot`, `/approval <mode>`, `/reconnect`, `/agents`, `/stop`, `/exit`).
+`--env-file=<path>` is loaded via Node's built-in `process.loadEnvFile`, so no `dotenv` dependency is needed. Without the flag the CLI reads the ambient process env. `-h` / `--help` prints the supported flags and the in-REPL slash commands (`/status`, `/usage`, `/tools`, `/history`, `/reset`, `/compact`, `/autopilot`, `/approval <mode>`, `/reconnect`, `/skills`, `/forget <name>`, `/agents`, `/stop [n]`, `/exit` — `/quit` does the same).
 
 The newer features are env-driven too: `AGENT_THINKING` (`off | minimal | low | medium | high | xhigh | <budget tokens>`), `AGENT_MAX_INPUT_TOKENS` / `AGENT_MAX_OUTPUT_TOKENS` / `AGENT_MAX_REASONING_TOKENS` / `AGENT_MAX_TOTAL_TOKENS`, `AGENT_MAX_TOOL_CALLS`, `AGENT_TOOL_APPROVAL` (`autopilot | ask-writes | ask-all | read-only`), `AGENT_TOOL_RULES` (JSON `{ "<tool or glob*>": "allow" | "ask" | "deny" }`, beats the mode — e.g. `{"github__delete_*":"deny"}`), `AGENT_EGRESS` (`on | off`; with `AGENT_EGRESS_ALLOW`, `AGENT_EGRESS_DENY`, `AGENT_EGRESS_PROTOCOLS`, `AGENT_EGRESS_ALLOW_PRIVATE` — see [Egress](#egress-what-the-model-may-fetch)), `AGENT_SKILLS_DIR`, `AGENT_LEARNING` (`on | off`; `AGENT_LEARNING_DIR` keeps the lessons across sessions — see [Learning](#learning-lessons-that-outlive-the-task)), `AGENT_TOOL_SELECTION_STRATEGY` (`auto | all | plan-narrowed | search`), `AGENT_CONTEXT_WINDOW_TOKENS`, `AGENT_COMPACTION_THRESHOLD` (percent of the window where auto-compaction starts, default 85) and `AGENT_COMPACTION=off`. The REPL prints the model's thoughts dimmed, auto-compacts its history with the same settings, and — when the approval mode asks — prompts `allow? [y]es / [n]o / [a]lways` right in the terminal; `/autopilot` toggles between autopilot and the last asking mode.
 
@@ -707,7 +741,18 @@ For local development against the source tree:
 npm start  # node --experimental-strip-types src/cli/start.ts --env-file=.env
 ```
 
-The CLI source lives in [`src/cli`](./src/cli) — see [`env.example`](./env.example) for the full list of recognized env vars.
+The CLI source lives in [`src/cli`](./src/cli) — [`env.example`](./env.example) is the full, commented list of recognized env vars. The core ones:
+
+| Variable | What it sets |
+| --- | --- |
+| `AGENT_PROVIDER_TYPE`, `AGENT_MODEL`, `AGENT_API_KEY`, `AGENT_BASE_URL` | The provider, the executor's model, its key and endpoint (`AGENT_BASE_URL` is required for `openai-compatible` and `azure`). |
+| `AGENT_PLANNER_MODEL`, `AGENT_SYNTHESIZER_MODEL` | A different model for the planner + replanner / the synthesizer; both default to `AGENT_MODEL`. |
+| `AGENT_PLANNER_*`, `AGENT_SYNTHESIZER_*` (`PROVIDER_TYPE`, `BASE_URL`, `API_KEY`, `PROVIDER_OPTIONS`) | Run a stage on another provider (see [Picking models per stage](#picking-models-per-stage)). A key is never inherited across vendors. |
+| `AGENT_PROVIDER_OPTIONS` | JSON spread into the provider factory (`{"region":"us-east-1"}`, Azure's `resourceName`, …). |
+| `AGENT_MAX_ITERATIONS`, `AGENT_MAX_STEPS_PER_TASK`, `AGENT_MAX_REVISIONS` | Loop caps: plan/execute/replan rounds, LLM steps inside one executor call, replanner "revise" decisions. |
+| `AGENT_LLM_TIMEOUT_MS`, `AGENT_LLM_MAX_RETRIES` | Per-call timeout (`0` = off) and retries on 5xx / 429 / network errors (default 2). |
+| `AGENT_AVAILABLE_TOOLS`, `AGENT_EXCLUDED_TOOLS` | Comma lists of MCP tool names to offer / withhold (available wins). |
+| `AGENT_CLIENT_NAME`, `AGENT_LOG_LEVEL` | The `User-Agent` sent on MCP / provider requests; `none \| error \| warn \| info \| debug`. |
 
 ## Build & test
 
