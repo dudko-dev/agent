@@ -1,5 +1,8 @@
 # CLAUDE.md
 
+> **Moved.** This package now lives in the `dudko-dev/agents` monorepo (`packages/agent`). Do not make
+> changes here; this repository is read-only history.
+
 ## Project
 
 `@dudko.dev/agent` — tool-using planning agent over MCP servers, built on the Vercel AI SDK. TypeScript, ESM, Node ≥22.6.
